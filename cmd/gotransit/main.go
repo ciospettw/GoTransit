@@ -24,6 +24,11 @@ const exampleConfig = `# gotransit.toml — the whole configuration. Anything om
 listen   = ":8080"
 # debug_ui = false     # map debug interface at / (default: on)
 
+# [cache]              # optional on-disk cache of remote sources: a warm
+# dir = "/var/cache/gotransit"   # restart revalidates (ETag/Last-Modified)
+                       # and reuses unchanged OSM/GTFS instead of
+                       # re-downloading. Default: off, fully ephemeral.
+
 [osm]
 # Geofabrik is the supported OSM host: its -updates/ osmChange stream keeps
 # the street graph fresh at runtime with zero downtime. A local path (or

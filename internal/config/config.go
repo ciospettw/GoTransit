@@ -55,6 +55,14 @@ type Config struct {
 		AllowInsecure bool
 	}
 
+	// Cache: optional on-disk copy of remote sources. When set, warm
+	// restarts revalidate with conditional GET (ETag / Last-Modified) and
+	// reuse the cached OSM extract / GTFS zips instead of re-downloading.
+	// Empty = fully ephemeral (the default, nothing ever touches disk).
+	Cache struct {
+		Dir string
+	}
+
 	Feeds []Feed
 
 	Realtime struct {
@@ -145,6 +153,8 @@ func parse(data []byte) (*Config, error) {
 	c := Default()
 	c.Listen = t.Str("listen", c.Listen)
 	c.DebugUI = t.Bool("debug_ui", c.DebugUI)
+
+	c.Cache.Dir = t.Str("cache.dir", "")
 
 	c.OSM.URL = t.Str("osm.url", "")
 	c.OSM.AllowInsecure = t.Bool("osm.allow_insecure", false)

@@ -82,13 +82,47 @@ func (r *Runtime) Run() {
 	e, up, srv, cfg, log := r.E, r.Up, r.Srv, r.Cfg, r.Log
 	t0 := time.Now()
 
+	cache := updater.Cache{Dir: cfg.Cache.Dir}
+
 	// ---- street graph ----
 	pbfPath := ""
 	ephemeralPBF := false
-	if cfg.OSMLocal() {
+	switch {
+	case cfg.OSMLocal():
 		pbfPath = config.LocalPath(cfg.OSM.URL)
 		log.Info("using local OSM extract (kept in place)", "path", pbfPath)
-	} else {
+	case cache.Enabled():
+		// warm restart: revalidate with conditional GET, reuse on 304 —
+		// a 380 MB extract that didn't change is not downloaded again
+		meta, _ := cache.Meta("osm.pbf", cfg.OSM.URL)
+		cached, hasFile := cache.FilePath("osm.pbf")
+		etag, lastMod := "", ""
+		if hasFile {
+			etag, lastMod = meta.ETag, meta.LastMod
+		}
+		retryForever(log, "osm download", func() error {
+			tmp, n, changed, etagOut, lastModOut, err := updater.FetchToTempCond(cfg.OSM.URL, cfg.OSM.AllowInsecure, etag, lastMod)
+			switch {
+			case err != nil && hasFile:
+				log.Warn("OSM revalidation failed: using the cached extract", "err", err)
+				pbfPath = cached
+			case err != nil:
+				return err
+			case !changed:
+				log.Info("OSM unchanged upstream (304): using the cached extract", "path", cached)
+				pbfPath = cached
+			default:
+				p, aerr := cache.AdoptFile("osm.pbf", cfg.OSM.URL, tmp, etagOut, lastModOut)
+				if aerr != nil {
+					os.Remove(tmp)
+					return aerr
+				}
+				pbfPath = p
+				log.Info("OSM extract downloaded into cache", "MB", n/1e6, "path", p)
+			}
+			return nil
+		})
+	default:
 		log.Info("downloading OSM extract to a temp file", "url", cfg.OSM.URL)
 		retryForever(log, "osm download", func() error {
 			p, n, err := updater.FetchToTemp(cfg.OSM.URL, cfg.OSM.AllowInsecure)
@@ -133,14 +167,39 @@ func (r *Runtime) Run() {
 			log.Info("using local GTFS (kept in place, reloaded on change)", "feed", f.Name)
 			continue
 		}
+		// warm restart: seed the conditional GET with the cached validators;
+		// on 304 (or sha match) the cached zip is reused, nothing re-downloads
+		cacheName := "gtfs-" + f.Name + ".zip"
+		meta, _ := cache.Meta(cacheName, f.URL)
+		cachedZip, _ := cache.LoadBytes(cacheName)
+		etag, lastMod, sha := "", "", ""
+		if cachedZip != nil {
+			etag, lastMod, sha = meta.ETag, meta.LastMod, meta.SHA256
+		}
+		installCached := func(why string) {
+			up.InstallFeedZip(f.Name, updater.CondResult{
+				Data: cachedZip, Changed: true, ETag: meta.ETag, LastMod: meta.LastMod, SHA256: meta.SHA256,
+			})
+			log.Info("GTFS from cache ("+why+")", "feed", f.Name, "MB", len(cachedZip)/1e6)
+		}
 		log.Info("downloading GTFS into memory", "feed", f.Name, "url", f.URL)
 		retryForever(log, "gtfs download "+f.Name, func() error {
-			res, err := updater.FetchBytesCond(f.URL, f.AllowInsecure, "", "", "", f.Headers)
-			if err != nil {
+			res, err := updater.FetchBytesCond(f.URL, f.AllowInsecure, etag, lastMod, sha, f.Headers)
+			switch {
+			case err != nil && cachedZip != nil:
+				log.Warn("GTFS revalidation failed: using the cached zip", "feed", f.Name, "err", err)
+				installCached("fetch failed")
+			case err != nil:
 				return err
+			case !res.Changed && cachedZip != nil:
+				installCached("unchanged upstream")
+			default:
+				up.InstallFeedZip(f.Name, res)
+				if serr := cache.StoreBytes(cacheName, f.URL, res.Data, res.ETag, res.LastMod, res.SHA256); serr != nil {
+					log.Warn("GTFS cache write failed", "feed", f.Name, "err", serr)
+				}
+				log.Info("GTFS in memory", "feed", f.Name, "MB", len(res.Data)/1e6, "etag", res.ETag != "")
 			}
-			up.InstallFeedZip(f.Name, res)
-			log.Info("GTFS in memory", "feed", f.Name, "MB", len(res.Data)/1e6, "etag", res.ETag != "")
 			return nil
 		})
 	}

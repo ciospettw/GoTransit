@@ -44,6 +44,8 @@ type Updater struct {
 	// OnSwap runs after every timetable swap (e.g. re-project GTFS-RT).
 	OnSwap func()
 
+	cache Cache // optional on-disk cache: refreshed zips are persisted for warm restarts
+
 	mu      sync.Mutex
 	srcBlob []byte
 	feeds   map[string]*feedData
@@ -55,6 +57,7 @@ type Updater struct {
 func New(e *engine.Engine, cfg *config.Config, log *slog.Logger) *Updater {
 	u := &Updater{
 		E: e, Cfg: cfg, Log: log,
+		cache:     Cache{Dir: cfg.Cache.Dir},
 		feeds:     map[string]*feedData{},
 		rebuildMu: make(chan struct{}, 1),
 	}
@@ -178,6 +181,9 @@ func (u *Updater) syncRemoteFeed(f config.Feed) error {
 	u.Log.Info("gtfs changed, rebuilding timetable in background", "feed", f.Name,
 		"bytes", len(res.Data), "download", res.Duration.Round(time.Millisecond))
 	u.InstallFeedZip(f.Name, res)
+	if err := u.cache.StoreBytes("gtfs-"+f.Name+".zip", f.URL, res.Data, res.ETag, res.LastMod, res.SHA256); err != nil {
+		u.Log.Warn("gtfs cache write failed", "feed", f.Name, "err", err)
+	}
 	if err := u.RebuildTimetable(); err != nil {
 		return err
 	}
