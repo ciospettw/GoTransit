@@ -319,15 +319,15 @@ func (s *session) refreshTimes(tt *transit.Timetable, o *transit.RTOverlay, now 
 		if i == s.legIdx && s.boarded {
 			// already on it: only the arrival matters
 		} else {
-			// can we still make this boarding? (bus early + user later = missed)
-			slack := time.Duration(0)
-			if i > s.legIdx {
-				slack = 0 // cursor already includes walking
-			}
-			if feas.ok && cursor.Add(slack).After(depRT) && o.TripPassed(r.trip) >= int16(r.board) {
+			// A connection counts as missed ONLY when GTFS-RT confirms the
+			// vehicle already cleared the boarding stop before the rider
+			// could be there. Predicted departures are not enough: near the
+			// start of a run (vehicle held at its terminus, delay not yet
+			// propagated) the clock slides past the scheduled time and a
+			// prediction-based check produces false "missed_connection"
+			// reroutes for a bus that has not even left.
+			if feas.ok && cursor.After(depRT) && o.TripPassed(r.trip) >= int16(r.board) {
 				feas = feasibility{false, "missed_connection", "your connection already left its stop"}
-			} else if feas.ok && cursor.After(depRT.Add(30*time.Second)) {
-				feas = feasibility{false, "missed_connection", "you can no longer reach this departure in time"}
 			}
 			if depRT.After(cursor) {
 				cursor = depRT
