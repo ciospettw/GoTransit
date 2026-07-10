@@ -1,0 +1,14 @@
+# binary + local runtime artifacts (the engine itself writes no files)
+/gotransit
+server.log
+*.log
+
+# operator-local config (generate with `gotransit init`)
+/gotransit.toml
+
+# local data captures for the real-data test suite
+/data/
+/testdata-captures/
+
+# OS noise
+.DS_Store
