@@ -41,11 +41,15 @@ type CondResult struct {
 
 // FetchBytesCond downloads url into memory with If-None-Match /
 // If-Modified-Since; a SHA-256 comparison catches servers that ignore them.
-func FetchBytesCond(url string, insecure bool, etag, lastMod, oldSHA string) (CondResult, error) {
+// hdr entries (may be nil) are attached to the request: private upstreams.
+func FetchBytesCond(url string, insecure bool, etag, lastMod, oldSHA string, hdr map[string]string) (CondResult, error) {
 	t0 := time.Now()
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
 		return CondResult{}, err
+	}
+	for k, v := range hdr {
+		req.Header.Set(k, v)
 	}
 	if etag != "" {
 		req.Header.Set("If-None-Match", etag)

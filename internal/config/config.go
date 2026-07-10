@@ -20,6 +20,10 @@ type Feed struct {
 	AllowInsecure bool          // permit plain http / invalid TLS, must be explicit
 	Poll          time.Duration // how often to check for changes
 
+	// Headers are attached to every outbound request for this feed (static
+	// zip and GTFS-RT alike): private upstreams behind a token, basic auth…
+	Headers map[string]string
+
 	// GTFS-Realtime endpoints (optional; enable live itineraries + tracking)
 	RTTripUpdates      string
 	RTVehiclePositions string
@@ -161,6 +165,17 @@ func parse(data []byte) (*Config, error) {
 		}
 		if f.RTPoll, err = ft.Dur("rt_poll", 20*time.Second); err != nil {
 			return nil, err
+		}
+		for _, h := range ft.Strs("headers") {
+			k, v, ok := strings.Cut(h, ":")
+			k, v = strings.TrimSpace(k), strings.TrimSpace(v)
+			if !ok || k == "" {
+				return nil, fmt.Errorf("config: [[gtfs]] %q: headers entries must be \"Name: value\", got %q", ft.Str("name", ""), h)
+			}
+			if f.Headers == nil {
+				f.Headers = map[string]string{}
+			}
+			f.Headers[k] = v
 		}
 		if f.URL == "" {
 			return nil, fmt.Errorf("config: [[gtfs]] #%d has no url", i+1)

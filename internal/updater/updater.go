@@ -157,7 +157,7 @@ func (u *Updater) syncRemoteFeed(f config.Feed) error {
 	etag, lastMod, sha := fd.etag, fd.lastMod, fd.sha
 	u.mu.Unlock()
 
-	res, err := FetchBytesCond(f.URL, f.AllowInsecure, etag, lastMod, sha)
+	res, err := FetchBytesCond(f.URL, f.AllowInsecure, etag, lastMod, sha, f.Headers)
 	if err != nil {
 		return err
 	}

@@ -354,6 +354,26 @@ func (t *Table) Str(path, def string) string {
 	return def
 }
 
+// Strs returns the array of strings at path, or nil. Non-string elements
+// are skipped: callers that need stricter typing validate the raw values.
+func (t *Table) Strs(path string) []string {
+	v, ok := t.lookup(path)
+	if !ok {
+		return nil
+	}
+	arr, ok := v.([]any)
+	if !ok {
+		return nil
+	}
+	out := make([]string, 0, len(arr))
+	for _, e := range arr {
+		if s, ok := e.(string); ok {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
 // Int returns the integer at path, or def.
 func (t *Table) Int(path string, def int64) int64 {
 	if v, ok := t.lookup(path); ok {
