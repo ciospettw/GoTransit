@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"gotransit/internal/engine"
+	"gotransit/internal/track"
 )
 
 //go:embed debug.html
@@ -26,7 +27,8 @@ type TrackSink interface {
 }
 
 // TrackFunc runs one journey-tracking session (wired to track.Tracker.Run).
-type TrackFunc func(ctx context.Context, itineraryID string, sink TrackSink) error
+// fixes carries the client's optional GPS position stream (may be nil).
+type TrackFunc func(ctx context.Context, itineraryID string, sink TrackSink, fixes <-chan track.Fix) error
 
 // Server wraps the engine with HTTP handlers.
 type Server struct {
@@ -76,12 +78,44 @@ func (s *Server) handleTrack(w http.ResponseWriter, r *http.Request) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	// reader: consume client frames (pings handled inside), detect disconnect
+	// reader: parse client GPS fixes ({"type":"position",...}), answer pings
+	// (inside ReadMessage), detect disconnect. Fixes are best-effort: a slow
+	// session keeps only the freshest one, older frames are dropped.
+	fixes := make(chan track.Fix, 4)
 	go func() {
 		defer cancel()
 		for {
-			if _, err := ws.ReadMessage(90 * time.Second); err != nil {
+			msg, err := ws.ReadMessage(90 * time.Second)
+			if err != nil {
 				return
+			}
+			var m struct {
+				Type      string  `json:"type"`
+				Lat       float64 `json:"lat"`
+				Lon       float64 `json:"lon"`
+				AccuracyM float64 `json:"accuracy_m"`
+				TS        string  `json:"ts"` // RFC3339, optional
+			}
+			if json.Unmarshal(msg, &m) != nil || m.Type != "position" {
+				continue
+			}
+			f := track.Fix{Lat: m.Lat, Lon: m.Lon, AccuracyM: m.AccuracyM, At: time.Now()}
+			if m.TS != "" {
+				if t, err := time.Parse(time.RFC3339, m.TS); err == nil {
+					f.At = t
+				}
+			}
+			select {
+			case fixes <- f:
+			default: // full: drop the oldest, keep the freshest
+				select {
+				case <-fixes:
+				default:
+				}
+				select {
+				case fixes <- f:
+				default:
+				}
 			}
 		}
 	}()
@@ -102,7 +136,7 @@ func (s *Server) handleTrack(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 
-	if err := s.Track(ctx, id, wsSink{ws}); err != nil && ctx.Err() == nil {
+	if err := s.Track(ctx, id, wsSink{ws}, fixes); err != nil && ctx.Err() == nil {
 		s.Log.Debug("track session ended", "err", err)
 	}
 }

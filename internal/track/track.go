@@ -56,6 +56,10 @@ type evProgress struct {
 	LegIndex int    `json:"leg_index"`
 	Boarded  bool   `json:"boarded,omitempty"`
 	Passed   *place `json:"passed_stop,omitempty"`
+	// with client GPS: live meters left to the target of the current phase
+	// (leg endpoint while walking, the boarding stop while waiting).
+	// Pointer: 0 m is meaningful (you are there), absent = no GPS.
+	DistM *int `json:"distance_to_stop_m,omitempty"`
 }
 type place struct {
 	StopID string `json:"stop_id"`
@@ -90,6 +94,15 @@ type evVehicle struct {
 	DelayS    int     `json:"delay_s"`
 	Boarded   bool    `json:"boarded"`
 }
+// evDeviation reports a GPS-confirmed departure from the plan; it is always
+// followed by a reroute (same kind as reason) carrying the recovery plan.
+type evDeviation struct {
+	Type         string `json:"type"` // "deviation"
+	Kind         string `json:"kind"` // missed_alight | left_vehicle_early | off_route
+	LegIndex     int    `json:"leg_index"`
+	ExpectedStop *place `json:"expected_stop,omitempty"` // where the plan said to alight
+	Message      string `json:"message"`
+}
 type evArrived struct {
 	Type   string    `json:"type"` // "arrived"
 	Arrive time.Time `json:"arrive"`
@@ -116,10 +129,12 @@ type session struct {
 	lastTry   time.Time // infeasibility replan attempt throttle
 	warned    map[string]bool
 	arrivedAt time.Time
+	gps       gpsState // client position evidence (optional)
 }
 
 // Run drives one tracking session until arrival, error or ctx cancellation.
-func (t *Tracker) Run(ctx context.Context, itID string, sink Sink) error {
+// fixes MAY be nil: without client positions the virtual rider governs alone.
+func (t *Tracker) Run(ctx context.Context, itID string, sink Sink, fixes <-chan Fix) error {
 	cached, ok := t.E.LookupItinerary(itID)
 	if !ok {
 		sink.Send(evError{"error", "unknown or expired itinerary id; re-plan and reconnect"})
@@ -130,6 +145,7 @@ func (t *Tracker) Run(ctx context.Context, itID string, sink Sink) error {
 		it: cached.It, origArr: cached.It.Arrive,
 		liveMode: cached.It.Live,
 		lastEmit: map[int]legTime{}, warned: map[string]bool{},
+		gps: newGPSState(),
 	}
 	mode := "monitor"
 	if s.liveMode {
@@ -157,6 +173,12 @@ func (t *Tracker) Run(ctx context.Context, itID string, sink Sink) error {
 			return ctx.Err()
 		case <-changed:
 		case <-tick.C:
+		case f, ok := <-fixes:
+			if !ok {
+				fixes = nil // client stopped sending: back to virtual-only
+				continue
+			}
+			s.gps.update(f, time.Now())
 		}
 		done, err := s.evaluate(time.Now())
 		if err != nil {
@@ -192,6 +214,14 @@ func (s *session) evaluate(now time.Time) (bool, error) {
 	times, feas := s.refreshTimes(tt, o, now)
 	s.emitDelays(times, now)
 	s.emitVehicle(tt, o)
+	s.emitWalkProgress(tt, now)
+
+	// GPS-confirmed deviations outrank plan feasibility: the rider already
+	// IS somewhere else, the plan must follow them
+	if dev := s.gpsDeviation(tt, o, now); dev != nil {
+		s.sink.Send(dev.ev)
+		return false, s.reroute(tt, o, now, dev.ev.Kind, dev.ev.Message, 0)
+	}
 
 	if !feas.ok {
 		s.t.Log.Debug("infeasible", "reason", feas.reason, "legIdx", s.legIdx, "boarded", s.boarded)
@@ -213,22 +243,59 @@ func (s *session) evaluate(now time.Time) (bool, error) {
 		}
 	}
 
-	// opportunistic improvement: only when it truly pays (≥ min saving) and
-	// not more often than once a minute — povero utente.
-	if now.Sub(s.lastRR) >= time.Minute && s.rerouteAllowed(tt) {
+	// opportunistic improvement: only when it truly pays (≥ min saving), not
+	// more often than once every 3 minutes after ANY reroute, and never
+	// moments before a boarding the rider is already committed to — povero
+	// utente, non si fanno 300 reroute né switch all'ultimo secondo.
+	if now.Sub(s.lastRR) >= betterArrivalCooldown && s.rerouteAllowed(tt) && !s.boardingImminent(now) {
 		s.tryBetterArrival(tt, o, now)
 	}
 	return false, nil
 }
 
-// advance moves the virtual user along the plan using clock + RT confirmations.
+// betterArrivalCooldown paces opportunistic reroutes; infeasibility reroutes
+// (cancelled, missed, deviations) are never delayed by it.
+const betterArrivalCooldown = 3 * time.Minute
+
+// boardingImminent reports whether the next boarding is ≤3 minutes away:
+// proposing a different bus while the rider watches theirs pull in is churn,
+// not help.
+func (s *session) boardingImminent(now time.Time) bool {
+	for i := s.legIdx; i < len(s.it.Legs); i++ {
+		leg := &s.it.Legs[i]
+		if leg.Mode != "transit" {
+			continue
+		}
+		if i == s.legIdx && s.boarded {
+			return false // already riding: switches only via downstream stops
+		}
+		dep := leg.Depart
+		if lt, ok := s.lastEmit[i]; ok && !lt.Depart.IsZero() {
+			dep = lt.Depart // RT-adjusted
+		}
+		return dep.Sub(now) <= 3*time.Minute && dep.After(now.Add(-time.Minute))
+	}
+	return false
+}
+
+// advance moves the virtual user along the plan using clock + RT
+// confirmations, refined (never contradicted) by client GPS evidence.
 func (s *session) advance(tt *transit.Timetable, o *transit.RTOverlay, now time.Time) {
 	for s.legIdx < len(s.it.Legs) {
 		leg := &s.it.Legs[s.legIdx]
 		if leg.Mode != "transit" {
-			if now.After(leg.Arrive) {
+			// GPS: reaching the leg's endpoint early beats the planned clock
+			// (arriving early at a stop only ever helps)
+			atEnd := false
+			if s.gps.fresh(now) {
+				near := s.gps.distTo(leg.To.Lat, leg.To.Lon) <= s.gps.radius(nearStopBase)
+				atEnd = hold(&s.gps.nearStopSince, near, now, atStopHold)
+			}
+			if now.After(leg.Arrive) || atEnd {
 				s.legIdx++
 				s.boarded = false
+				s.gps.resetLegAnchors()
+				s.emitPhase() // the client must always know the current leg
 				continue
 			}
 			return
@@ -247,17 +314,34 @@ func (s *session) advance(tt *transit.Timetable, o *transit.RTOverlay, now time.
 		passed := o.TripPassed(r.trip)
 
 		if !s.boarded {
-			if passed >= int16(r.board) || (passed < 0 && now.After(depRT.Add(90*time.Second))) {
+			// GPS: sustained co-location with the tracked vehicle confirms
+			// boarding before the feed's Passed does — but only once the
+			// vehicle is confirmedly past the boarding stop: standing at the
+			// stop next to a dwelling bus must never count as being on it
+			if passed >= int16(r.board) || (passed < 0 && now.After(depRT.Add(90*time.Second))) ||
+				(s.vehicleBeyond(tt, o, r, int(r.board)) && s.gpsWithVehicle(tt, o, r, now, confirmOn)) {
 				s.boarded = true
+				s.gps.resetLegAnchors()
 				s.sink.Send(evProgress{Type: "progress", Status: "riding", LegIndex: s.legIdx, Boarded: true})
 			} else {
 				return // still waiting at the stop
 			}
 		}
 		if passed >= int16(r.alight) || now.After(arrRT.Add(90*time.Second)) {
+			// GPS veto: the feed says the vehicle cleared the stop, but the
+			// rider is still measurably ON it → hold; gpsDeviation decides
+			// (missed_alight) once the evidence is conclusive
+			if s.gpsWithVehicle(tt, o, r, now, 0) {
+				return
+			}
 			s.legIdx++
 			s.boarded = false
+			s.gps.resetLegAnchors()
 			s.sink.Send(evProgress{Type: "progress", Status: "alighted", LegIndex: s.legIdx - 1})
+			// unless GPS says otherwise the rider got off where we told them:
+			// hand over to the next phase EXPLICITLY, so the client can start
+			// turn-by-turn toward the next stop instead of hanging on "alight"
+			s.emitPhase()
 			// the vehicle may have run early/late: re-anchor the following
 			// street leg to the actual alighting moment
 			if s.legIdx < len(s.it.Legs) && s.it.Legs[s.legIdx].Mode != "transit" {
@@ -273,6 +357,19 @@ func (s *session) advance(tt *transit.Timetable, o *transit.RTOverlay, now time.
 		}
 		return // riding
 	}
+}
+
+// emitPhase tells the client which leg is now current and in which phase —
+// sent at every leg transition so the UI is never left guessing.
+func (s *session) emitPhase() {
+	if s.legIdx >= len(s.it.Legs) {
+		return
+	}
+	status := "walking"
+	if s.it.Legs[s.legIdx].Mode == "transit" {
+		status = "waiting"
+	}
+	s.sink.Send(evProgress{Type: "progress", Status: status, LegIndex: s.legIdx, Boarded: s.boarded})
 }
 
 // feasibility of the remaining plan
@@ -543,6 +640,8 @@ func (s *session) switchTo(it engine.Itinerary, reason, msg string, saving int) 
 	s.lastEmit = map[int]legTime{}
 	s.lastVeh = evVehicle{}
 	s.warned = map[string]bool{} // fresh plan, fresh guard state
+	s.gps.resetLegAnchors()
+	s.gps.deviated = map[string]bool{} // fresh plan, fresh deviation slate
 	s.liveMode = it.Live || s.liveMode
 	s.sink.Send(evReroute{Type: "reroute", Reason: reason, SavingS: saving, Message: msg,
 		ChangedLegs: changed, Itinerary: it})
@@ -621,11 +720,12 @@ func (s *session) replan(tt *transit.Timetable, o *transit.RTOverlay, now time.T
 		if err != nil || len(its) == 0 {
 			return engine.Itinerary{}, false
 		}
-		return pickLive(its, s.liveMode), true
+		return pickBest(its, s.liveMode), true
 	}
 
-	// walking or waiting: replan from the virtual point along the plan
-	lat, lon := s.virtualPoint(now)
+	// walking or waiting: replan from the rider's real position when the
+	// client streams GPS, else from the virtual point along the plan
+	lat, lon := s.replanPoint(now)
 	req := s.req
 	req.FromLat, req.FromLon = lat, lon
 	req.ToLat, req.ToLon = dLat, dLon
@@ -637,23 +737,70 @@ func (s *session) replan(tt *transit.Timetable, o *transit.RTOverlay, now time.T
 	if err != nil || len(resp.Itineraries) == 0 {
 		return engine.Itinerary{}, false
 	}
-	return pickLive(resp.Itineraries, s.liveMode), true
+	return pickBest(resp.Itineraries, s.liveMode), true
 }
 
-// pickLive prefers RT-confirmed alternatives when tracking live.
-func pickLive(its []engine.Itinerary, wantLive bool) engine.Itinerary {
-	if wantLive {
-		for _, it := range its {
-			if it.Live {
-				return it
+// pickBest chooses the reroute target with three rules, in order:
+//  1. realtime confidence — never move a rider onto a schedule-only bus when
+//     an RT-confirmed (trip updates) alternative exists; delays are already
+//     folded into the times, so a late-but-catchable bus competes fairly;
+//  2. earlier arrival (beyond a 60s tie window);
+//  3. less walking — the same vehicle at a nearer stop beats a farther stop
+//     with an earlier vehicle ETA: you walk less and arrive when you arrive.
+func pickBest(its []engine.Itinerary, wantLive bool) engine.Itinerary {
+	class := func(it *engine.Itinerary) int {
+		if wantLive && it.Live {
+			return 0
+		}
+		for i := range it.Legs {
+			if it.Legs[i].Mode == "transit" {
+				if it.Legs[i].Realtime {
+					return 1
+				}
+				return 2
 			}
 		}
+		return 1 // no transit at all: nothing needing confirmation
 	}
-	return its[0]
+	walk := func(it *engine.Itinerary) int {
+		total := 0
+		for i := range it.Legs {
+			if it.Legs[i].Mode != "transit" {
+				total += it.Legs[i].DurationS
+			}
+		}
+		return total
+	}
+	best := 0
+	for i := 1; i < len(its); i++ {
+		a, b := &its[best], &its[i]
+		ca, cb := class(a), class(b)
+		switch {
+		case cb < ca:
+			best = i
+		case cb > ca:
+		case b.Arrive.Before(a.Arrive.Add(-60 * time.Second)):
+			best = i
+		case a.Arrive.Before(b.Arrive.Add(-60 * time.Second)):
+		case walk(b) < walk(a):
+			best = i
+		}
+	}
+	return its[best]
+}
+
+// replanPoint is where replans start from: the real GPS fix when fresh,
+// otherwise the plan-based estimate.
+func (s *session) replanPoint(now time.Time) (float64, float64) {
+	if s.gps.fresh(now) {
+		return s.gps.cur.Lat, s.gps.cur.Lon
+	}
+	return s.virtualPoint(now)
 }
 
 // virtualPoint estimates where the user is along the current street leg
-// (or pins them at the stop while waiting).
+// (or pins them at the stop while waiting). Deliberately plan-based: the
+// off_route detector compares the GPS against THIS expectation.
 func (s *session) virtualPoint(now time.Time) (float64, float64) {
 	leg := &s.it.Legs[s.legIdx]
 	if leg.Mode == "transit" {

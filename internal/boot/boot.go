@@ -246,8 +246,8 @@ func (r *Runtime) Run() {
 			}
 		}
 		tracker := &track.Tracker{E: e, Mgr: mgr, Cfg: cfg, Log: log}
-		srv.Track = func(ctx context.Context, id string, sink api.TrackSink) error {
-			return tracker.Run(ctx, id, sink)
+		srv.Track = func(ctx context.Context, id string, sink api.TrackSink, fixes <-chan track.Fix) error {
+			return tracker.Run(ctx, id, sink, fixes)
 		}
 		mgr.Start()
 		r.rtMgr.Store(mgr)
@@ -259,8 +259,8 @@ func (r *Runtime) Run() {
 			}
 		}
 		tracker := &track.Tracker{E: e, Cfg: cfg, Log: log}
-		srv.Track = func(ctx context.Context, id string, sink api.TrackSink) error {
-			return tracker.Run(ctx, id, sink)
+		srv.Track = func(ctx context.Context, id string, sink api.TrackSink, fixes <-chan track.Fix) error {
+			return tracker.Run(ctx, id, sink, fixes)
 		}
 		log.Info("no gtfs-rt sources configured: tracking runs in schedule-only monitor mode")
 	}

@@ -53,7 +53,7 @@ func TestE2ELiveTracking(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := make(chan error, 1)
-	go func() { done <- tracker.Run(ctx, it.ID, sink) }()
+	go func() { done <- tracker.Run(ctx, it.ID, sink, nil) }()
 
 	waitFor(t, sink, "hello", 2*time.Second, func(ev map[string]any) bool {
 		return ev["type"] == "hello" && ev["mode"] == "live"
