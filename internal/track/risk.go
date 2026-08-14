@@ -70,7 +70,8 @@ func (s *session) evaluateRisk(tt *transit.Timetable, o *transit.RTOverlay, now 
 		leg := &s.it.Legs[i]
 		lt, hasLT := byIdx[i]
 		if leg.Mode != "transit" {
-			walkSec += float64(leg.DurationS)
+			remainingWalk := streetTimeRemaining(leg, lt, hasLT, i == s.legIdx, now)
+			walkSec += remainingWalk.Seconds()
 			if hasLT {
 				arrivalAtStop = lt.Arrive
 			}
@@ -203,6 +204,21 @@ func (s *session) evaluateRisk(tt *transit.Timetable, o *transit.RTOverlay, now 
 		}
 	}
 	return false
+}
+
+// streetTimeRemaining is the uncertain walking/riding time still to perform.
+// Before a future leg has started, waiting for its departure is deterministic
+// schedule time and must not inflate the walking uncertainty in stats.Conn.
+func streetTimeRemaining(leg *engine.Leg, lt legTime, hasLT, current bool, now time.Time) time.Duration {
+	dur := time.Duration(leg.DurationS) * time.Second
+	if !current || !hasLT || now.Before(lt.Depart) {
+		return dur
+	}
+	remaining := lt.Arrive.Sub(now)
+	if remaining < 0 {
+		return 0
+	}
+	return remaining
 }
 
 // legDist queries the learned distribution for a leg's route at its local

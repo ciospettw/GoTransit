@@ -12,11 +12,9 @@ import (
 // computeSnaps anchors every stop onto the walking graph.
 func computeSnaps(tt *Timetable, g *graph.Graph, snapRadiusM int) {
 	tt.StopSnap = make([]StopSnap, len(tt.StopID))
-	sf := graph.SpeedFactor(4.8) // snapping cost uses a nominal walk speed
 	workers := runtime.NumCPU()
 	var wg sync.WaitGroup
 	chunk := (len(tt.StopID) + workers - 1) / workers
-	var unsnapped []int32
 	var mu sync.Mutex
 	for w := 0; w < workers; w++ {
 		lo, hi := w*chunk, min((w+1)*chunk, len(tt.StopID))
@@ -28,18 +26,20 @@ func computeSnaps(tt *Timetable, g *graph.Graph, snapRadiusM int) {
 			defer wg.Done()
 			local := 0
 			for i := lo; i < hi; i++ {
-				tt.StopSnap[i] = StopSnap{NodeU: -1, NodeV: -1}
+				tt.StopSnap[i] = StopSnap{NodeU: -1, NodeV: -1, Edge: -1}
 				sn, ok := g.SnapPoint(tt.StopLat[i], tt.StopLon[i], graph.ModeFoot, float64(snapRadiusM))
 				if !ok {
 					local++
 					continue
 				}
-				dsU := metersToDs(sn.PerpM+sn.AlongU, sf)
-				dsV := metersToDs(sn.PerpM+sn.AlongV, sf)
 				tt.StopSnap[i] = StopSnap{
 					NodeU: sn.U, NodeV: sn.V,
-					DsU: clampU16(dsU), DsV: clampU16(dsV),
-					PerpM: clampU16(uint32(sn.PerpM)),
+					Edge:    sn.Fwd,
+					MetersU: clampMeters(sn.PerpM + sn.AlongU),
+					MetersV: clampMeters(sn.PerpM + sn.AlongV),
+					PerpM:   clampMeters(sn.PerpM),
+					SnapLat: sn.PLat, SnapLon: sn.PLon,
+					AlongU: float32(sn.AlongU),
 				}
 			}
 			mu.Lock()
@@ -48,11 +48,10 @@ func computeSnaps(tt *Timetable, g *graph.Graph, snapRadiusM int) {
 		}(lo, hi)
 	}
 	wg.Wait()
-	_ = unsnapped
 }
 
-func metersToDs(m float64, sf uint32) uint32 {
-	return (uint32(m) * sf) >> 16
+func metersToDs(m uint32, sf uint32) uint32 {
+	return uint32((uint64(m) * uint64(sf)) >> 16)
 }
 
 func clampU16(v uint32) uint16 {
@@ -60,6 +59,16 @@ func clampU16(v uint32) uint16 {
 		return 65535
 	}
 	return uint16(v)
+}
+
+func clampMeters(m float64) uint16 {
+	if m <= 0 {
+		return 0
+	}
+	if m >= 65535 {
+		return 65535
+	}
+	return uint16(m + 0.5)
 }
 
 type xferEntry struct {
@@ -71,22 +80,24 @@ type xferEntry struct {
 // records which other stops it reaches within the radius.
 func computeTransfers(tt *Timetable, g *graph.Graph, walkKmh float64, radiusM int) {
 	sf := graph.SpeedFactor(walkKmh)
-	maxDs := metersToDs(float64(radiusM), sf)
+	maxDs := metersToDs(uint32(radiusM), sf)
 
-	// reverse index: graph node → (stop, access ds)
+	// Reverse index: graph node → (stop, connector metres). Keeping the
+	// attachment independent of speed lets every query apply its configured
+	// walk/bike speed instead of inheriting a compile-time nominal speed.
 	type nodeStop struct {
-		node  int32
-		stop  int32
-		extra uint16
+		node   int32
+		stop   int32
+		extraM uint16
 	}
 	var ns []nodeStop
 	for s := range tt.StopSnap {
 		sn := &tt.StopSnap[s]
 		if sn.NodeU >= 0 {
-			ns = append(ns, nodeStop{sn.NodeU, int32(s), sn.DsU})
+			ns = append(ns, nodeStop{sn.NodeU, int32(s), sn.MetersU})
 		}
 		if sn.NodeV >= 0 {
-			ns = append(ns, nodeStop{sn.NodeV, int32(s), sn.DsV})
+			ns = append(ns, nodeStop{sn.NodeV, int32(s), sn.MetersV})
 		}
 	}
 	slices.SortFunc(ns, func(a, b nodeStop) int { return int(a.node) - int(b.node) })
@@ -97,10 +108,10 @@ func computeTransfers(tt *Timetable, g *graph.Graph, walkKmh float64, radiusM in
 	// publish the reverse index for query-time seed harvesting
 	tt.NSNode = nsNode
 	tt.NSStop = make([]int32, len(ns))
-	tt.NSExtra = make([]uint16, len(ns))
+	tt.NSExtraM = make([]uint16, len(ns))
 	for i := range ns {
 		tt.NSStop[i] = ns[i].stop
-		tt.NSExtra[i] = ns[i].extra
+		tt.NSExtraM[i] = ns[i].extraM
 	}
 
 	results := make([][]xferEntry, len(tt.StopID))
@@ -124,9 +135,9 @@ func computeTransfers(tt *Timetable, g *graph.Graph, walkKmh float64, radiusM in
 				if sn.NodeU < 0 {
 					continue
 				}
-				seeds := []graph.Seed{{Node: sn.NodeU, Ds: uint32(sn.DsU)}}
+				seeds := []graph.Seed{{Node: sn.NodeU, Ds: metersToDs(uint32(sn.MetersU), sf)}}
 				if sn.NodeV >= 0 {
-					seeds = append(seeds, graph.Seed{Node: sn.NodeV, Ds: uint32(sn.DsV)})
+					seeds = append(seeds, graph.Seed{Node: sn.NodeV, Ds: metersToDs(uint32(sn.MetersV), sf)})
 				}
 				search.Run(g, seeds, graph.ModeFoot, sf, maxDs)
 				clear(best)
@@ -139,7 +150,7 @@ func computeTransfers(tt *Timetable, g *graph.Graph, walkKmh float64, radiusM in
 						if s2 == int32(s) {
 							continue
 						}
-						total := d + uint32(ns[i].extra)
+						total := d + metersToDs(uint32(ns[i].extraM), sf)
 						if total > maxDs {
 							continue
 						}

@@ -21,6 +21,7 @@ func buildOverlay(tt *transit.Timetable, sources []Source, tus, vps map[int]*Fee
 		VehLon:    make([]int32, n),
 		VehPos:    make([]int16, n),
 		VehStatus: make([]int8, n),
+		VehTime:   make([]uint64, n),
 		FeedTime:  make([]uint64, len(tt.Feeds)),
 		Version:   version,
 	}
@@ -72,6 +73,23 @@ func buildOverlay(tt *transit.Timetable, sources []Source, tus, vps map[int]*Fee
 				if !ok {
 					continue
 				}
+				stamp := v.Timestamp
+				if stamp == 0 {
+					stamp = f.Timestamp
+				}
+				if stamp == 0 {
+					// Entity/header timestamps are optional. Keep the decode receipt
+					// time with the cached feed so a position cannot remain "fresh"
+					// forever merely because the upstream omitted both fields.
+					stamp = f.ReceivedAt
+				}
+				// Mixed endpoints occasionally duplicate a vehicle. Keep the
+				// newest timestamped entity so a late response cannot roll the
+				// vehicle back while TripUpdates continue to arrive.
+				if previous := o.VehTime[trip]; previous != 0 && (stamp == 0 || stamp < previous) {
+					continue
+				}
+				o.VehTime[trip] = stamp
 				o.HasRT[trip] = true
 				if v.Lat != 0 || v.Lon != 0 {
 					o.VehLat[trip] = int32(float64(v.Lat) * 1e7)

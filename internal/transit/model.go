@@ -75,9 +75,9 @@ type Timetable struct {
 
 	// reverse anchoring: graph node → stops anchored there (sorted by node),
 	// used to harvest stop seeds out of an access/egress street search.
-	NSNode  []int32
-	NSStop  []int32
-	NSExtra []uint16 // deciseconds from the node to the stop
+	NSNode   []int32
+	NSStop   []int32
+	NSExtraM []uint16 // metres from the node to the stop
 
 	Feeds    []string
 	Excluded ExclusionReport
@@ -103,9 +103,14 @@ type RouteMeta struct {
 
 // StopSnap anchors a stop onto the street graph for access/egress/transfers.
 type StopSnap struct {
-	NodeU, NodeV int32 // -1 when the stop could not be snapped
-	DsU, DsV     uint16
+	NodeU, NodeV int32  // -1 when the stop could not be snapped
+	Edge         int32  // directed NodeU → NodeV edge carrying the snapped geometry
+	MetersU      uint16 // complete stop ↔ NodeU connector (perpendicular + along-edge)
+	MetersV      uint16 // complete stop ↔ NodeV connector (perpendicular + along-edge)
 	PerpM        uint16
+	SnapLat      int32 // projected point on the street graph (E7)
+	SnapLon      int32
+	AlongU       float32 // geometry-only distance from NodeU to the projection
 }
 
 // ExclusionReport lists what coverage validation cut, per requirement:
@@ -150,6 +155,7 @@ type RTOverlay struct {
 	VehLon    []int32
 	VehPos    []int16
 	VehStatus []int8
+	VehTime   []uint64 // entity/header timestamp per trip; 0 when unavailable
 
 	// feed timestamps (unix) per static feed index; 0 = feed absent/stale
 	FeedTime []uint64
@@ -167,6 +173,15 @@ func (o *RTOverlay) Vehicle(trip uint32) (latE7, lonE7 int32, pos int16, status 
 		return 0, 0, -1, -1, false
 	}
 	return o.VehLat[trip], o.VehLon[trip], o.VehPos[trip], o.VehStatus[trip], true
+}
+
+// VehicleTime returns the best timestamp carried by the VehiclePosition
+// entity (falling back to its feed header), independently from TripUpdates.
+func (o *RTOverlay) VehicleTime(trip uint32) uint64 {
+	if o == nil || int(trip) >= len(o.VehTime) {
+		return 0
+	}
+	return o.VehTime[trip]
 }
 
 // SetRT atomically installs (or clears) the realtime overlay.

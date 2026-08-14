@@ -7,13 +7,15 @@ package rt
 import (
 	"fmt"
 	"math"
+	"time"
 )
 
 // Feed is one decoded GTFS-RT FeedMessage (trip updates and/or vehicles).
 type Feed struct {
-	Timestamp uint64
-	Trips     []TripRT
-	Vehicles  []VehicleRT
+	Timestamp  uint64
+	ReceivedAt uint64 // local decode time; fallback freshness for timestamp-less entities
+	Trips      []TripRT
+	Vehicles   []VehicleRT
 }
 
 // TripRT is one TripUpdate.
@@ -57,7 +59,7 @@ type VehicleRT struct {
 
 // Decode parses a FeedMessage.
 func Decode(data []byte) (*Feed, error) {
-	f := &Feed{}
+	f := &Feed{ReceivedAt: uint64(time.Now().Unix())}
 	p := wire{b: data}
 	for p.more() {
 		field, wt, err := p.field()

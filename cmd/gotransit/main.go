@@ -65,7 +65,7 @@ rt_vehicle_positions = "https://proxy.busone.app/trenitalia/gtfs-rt/vehicle-posi
 # live_first_leg_within = "45m" # live plans: first bus must be RT-confirmed and near
 # live_horizon          = "1h"  # ...and every leg in this window must be live
 # cancel_blind          = "3m"  # no-trace-after-terminus-departure suspicion window
-# (metro route types are always considered live: no VP/TU expected from them)
+# (rail-like routes stay trackable by timetable when no vehicle position exists)
 
 # [[gtfs]]             # local feeds are used in place, never deleted,
 # name = "mio"         # and reloaded when the file's mtime changes
@@ -78,6 +78,8 @@ rt_vehicle_positions = "https://proxy.busone.app/trenitalia/gtfs-rt/vehicle-posi
 # max_bike_access = "18m"
 # max_transfers   = 4
 # transfer_slack  = "90s"
+# rail_entry_buffer    = "60s"
+# rail_transfer_buffer = "90s"
 # transfer_radius_m = 400
 # snap_radius_m     = 300
 # bike_transit_min_saving = "5m"

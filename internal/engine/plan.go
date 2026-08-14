@@ -104,6 +104,10 @@ type Leg struct {
 	Steps     []Step     `json:"steps,omitempty"`
 	Realtime  bool       `json:"realtime,omitempty"` // trip has live GTFS-RT data
 	DelayS    int        `json:"delay_s,omitempty"`  // departure delay vs schedule
+	// BoardReadyAt is internal tracking metadata. It is populated when an
+	// onboard replan starts directly at a rail transfer, whose incoming-arrival
+	// anchor would otherwise be absent from the returned itinerary.
+	BoardReadyAt time.Time `json:"-"`
 
 	// Transit legs only: probability the rider makes THIS boarding given the
 	// connection slack and the delay distributions (risk.go). RiskLevel is
@@ -181,7 +185,7 @@ func (e *Engine) planRoad(mode string, fLat, fLon, tLat, tLon int32, when time.T
 		return nil, fmt.Errorf("no %s route found", mode)
 	}
 
-	leg := e.roadLeg(g, mode, m, sf, res.Edges, snF, snT, fLat, fLon, tLat, tLon)
+	leg := e.roadLeg(g, mode, m, sf, res.Edges, res.EndSeed, snF, snT, fLat, fLon, tLat, tLon)
 	dur := time.Duration(res.Ds) * 100 * time.Millisecond
 	depart := when.In(e.Timezone()) // answers always speak the network's timezone
 	if arriveBy {
@@ -190,6 +194,7 @@ func (e *Engine) planRoad(mode string, fLat, fLon, tLat, tLon int32, when time.T
 	leg.Depart = depart
 	leg.Arrive = depart.Add(dur)
 	leg.DurationS = int(dur.Seconds())
+	reconcileLegSteps(&leg)
 	it := &Itinerary{
 		Depart: leg.Depart, Arrive: leg.Arrive,
 		DurationS: leg.DurationS, Legs: []Leg{leg},
@@ -239,7 +244,11 @@ func partialDs(g *graph.Graph, e uint32, meters float64, m graph.Mode, sf uint32
 		}
 		return uint32(meters*36) / v
 	}
-	return (uint32(meters) * sf) >> 16
+	return fixedSpeedDs(uint32(meters), sf)
+}
+
+func fixedSpeedDs(meters uint32, sf uint32) uint32 {
+	return uint32((uint64(meters) * uint64(sf)) >> 16)
 }
 
 func max32(a, b int32) int32 {
@@ -253,9 +262,11 @@ func max32(a, b int32) int32 {
 
 // accessSet is one access/egress computation: stop → (seconds, anchor node).
 type accessSet struct {
-	sec    map[int32]uint32
-	anchor map[int32]int32
-	mode   string
+	sec          map[int32]uint32
+	anchor       map[int32]int32
+	mode         string
+	priorRailArr map[int32]uint32 // actual incoming-rail arrival by source stop
+	absolute     bool             // sec values are already seconds since midnight
 }
 
 func (e *Engine) planTransit(req Request, fLat, fLon, tLat, tLon int32, bikeAllowed bool) (*Response, error) {
@@ -443,7 +454,7 @@ func (e *Engine) reachStops(gb *GraphBundle, tb *TTBundle, lat, lon int32, m gra
 		i, _ := findNS(tt.NSNode, n)
 		for ; i < len(tt.NSNode) && tt.NSNode[i] == n; i++ {
 			s := tt.NSStop[i]
-			total := d + uint32(tt.NSExtra[i])
+			total := d + fixedSpeedDs(uint32(tt.NSExtraM[i]), sf)
 			if total > maxDs {
 				continue
 			}
@@ -484,11 +495,22 @@ func (e *Engine) runRaptor(gb *GraphBundle, tb *TTBundle, req Request, when time
 		Date:     dateInt(base),
 		Weekday:  base.Weekday(),
 		PrevDate: dateInt(prev), PrevWeekday: prev.Weekday(),
-		MaxTransfers: e.Cfg.Routing.MaxTransfers,
-		SlackSec:     uint32(e.Cfg.Routing.TransferSlack.Seconds()),
+		MaxTransfers:    e.Cfg.Routing.MaxTransfers,
+		SlackSec:        uint32(e.Cfg.Routing.TransferSlack.Seconds()),
+		RailEntrySec:    uint32(e.Cfg.Routing.RailEntryBuffer.Seconds()),
+		RailTransferSec: uint32(e.Cfg.Routing.RailTransferBuffer.Seconds()),
 	}
 	for s, sec := range acc.sec {
-		q.Sources = append(q.Sources, transit.StopSeed{Stop: s, Sec: depSec + sec})
+		at := depSec + sec
+		if acc.absolute {
+			at = sec
+		}
+		seed := transit.StopSeed{Stop: s, Sec: at}
+		if priorArr, ok := acc.priorRailArr[s]; ok {
+			seed.PriorRail = true
+			seed.PriorRailArrSec = priorArr
+		}
+		q.Sources = append(q.Sources, seed)
 	}
 	for s, sec := range egr.sec {
 		q.Targets = append(q.Targets, transit.StopSeed{Stop: s, Sec: sec})

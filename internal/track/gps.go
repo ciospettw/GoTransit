@@ -9,8 +9,10 @@ package track
 //                    proactive reroute ("too_slow") from their position.
 //   AT_STOP          wander tolerance: within stop_wander_radius (~150 m,
 //                    GPS jitter / coffee at the bar) nothing happens; beyond
-//                    it a background walk-back computation decides whether
-//                    they can still make it — only when they can't →
+//                    it ordered movement along the planned board→alight shape
+//                    can confirm boarding even without fresh vehicle data;
+//                    otherwise a background walk-back computation decides
+//                    whether they can still make it — only when they can't →
 //                    reroute ("left_stop").
 //   ONBOARD          NO GPS inference while riding, with ONE exception:
 //                    "stayed on the line" — the rider is >1 km from the
@@ -61,6 +63,17 @@ const (
 	offRouteDur  = 90 * time.Second // ...for this long → off route
 	walkDistStep = 30.0             // walk-progress re-emit threshold (meters)
 	guardHold    = 10 * time.Second // persistence for too_slow / left_stop
+
+	// Shape-only boarding fallback. Once the rider has reached the stop, a
+	// sequence of fresh fixes progressing board -> alight inside this
+	// corridor is stronger evidence than an absent/stale vehicle position.
+	shapeBoardAwayM       = 200.0
+	shapeBoardCorridorM   = 55.0
+	shapeBoardProgressM   = 30.0
+	shapeBoardStepM       = 5.0
+	shapeBoardBacktrackM  = 35.0
+	shapeBoardHold        = 5 * time.Second
+	shapeBoardMovingFixes = 2
 	// detour factor: street distance ≈ 1.3 × beeline when walking back
 	walkDetour = 1.3
 	// fix history kept for the shape-following check
@@ -83,15 +96,39 @@ type gpsState struct {
 	tooSlowSince  time.Time
 	leftStopSince time.Time
 
-	// reachedStop: the rider measurably reached the boarding stop of the
-	// current waiting leg (arms the wander/left_stop logic).
-	reachedStop bool
+	// reachedStops is a persistent, per-ride latch. Reaching a boarding stop
+	// is a historical fact and must survive the walk -> wait handoff (whose
+	// generic anchor reset used to erase the lone reachedStop bool).
+	reachedStops map[string]time.Time
+	shapeBoard   map[string]*shapeBoardState
 
 	lastWalkDist float64 // last emitted distance_to_stop_m (-1 = none)
 	deviated     map[string]bool
 }
 
-func newGPSState() gpsState { return gpsState{lastWalkDist: -1, deviated: map[string]bool{}} }
+// shapeBoardState consumes each fix at most once and remembers ordered
+// progress along one ride's board -> alight shape portion.
+type shapeBoardState struct {
+	lastAt           time.Time
+	lastProgress     float64
+	evidenceProgress float64
+	haveLast         bool
+	movingSince      time.Time
+	movingFrom       float64
+	movingFixes      int
+	onShape          bool
+	awayM            float64
+	accuracyM        float64
+}
+
+func newGPSState() gpsState {
+	return gpsState{
+		lastWalkDist: -1,
+		deviated:     map[string]bool{},
+		reachedStops: map[string]time.Time{},
+		shapeBoard:   map[string]*shapeBoardState{},
+	}
+}
 
 // update ingests a fix; implausible ones are dropped whole.
 func (g *gpsState) update(f Fix, now time.Time) {
@@ -177,16 +214,132 @@ func (g *gpsState) distTo(lat, lon float64) float64 {
 	return distMeters(g.cur.Lat, g.cur.Lon, lat, lon)
 }
 
-// resetLegAnchors clears the persistence anchors when the current leg (or the
-// whole plan) changes: evidence never carries over across legs.
+// resetLegAnchors clears transient persistence anchors when the current leg
+// changes. reachedStops and shapeBoard deliberately survive: both are keyed
+// per ride, so evidence cannot leak to another leg, while the fact that the
+// rider reached a stop survives the walk -> waiting handoff.
 func (g *gpsState) resetLegAnchors() {
 	g.nearStopSince = time.Time{}
 	g.withVehSince = time.Time{}
 	g.offRouteSince = time.Time{}
 	g.tooSlowSince = time.Time{}
 	g.leftStopSince = time.Time{}
-	g.reachedStop = false
 	g.lastWalkDist = -1
+}
+
+// boardingKey identifies a concrete boarding independently of its position in
+// the itinerary. A compatible reroute may move the same ride to another leg,
+// change its alight stop, or refresh its RT-adjusted departure; all of those
+// must retain the reached-stop fact. A tracking session cannot span two
+// service-day instances of the same namespaced trip, so trip + stop is stable.
+func (s *session) boardingKey(legIdx int) string {
+	if legIdx < 0 || legIdx >= len(s.it.Legs) {
+		return ""
+	}
+	leg := &s.it.Legs[legIdx]
+	return fmt.Sprintf("%s/%s", leg.TripID, leg.From.StopID)
+}
+
+func (g *gpsState) latchReachedStop(key string) {
+	if key == "" {
+		return
+	}
+	if g.reachedStops == nil {
+		g.reachedStops = map[string]time.Time{}
+	}
+	if _, ok := g.reachedStops[key]; !ok {
+		g.reachedStops[key] = g.cur.At
+	}
+}
+
+// gpsShapeBoarding recognizes the rider moving away on the planned vehicle's
+// own shape when Passed/VehiclePosition cannot corroborate boarding. It
+// returns following=true as soon as coherent movement exists so left_stop is
+// suspended while evidence accumulates; boarded becomes true only beyond
+// ~200 m and after sustained ordered progress.
+func (s *session) gpsShapeBoarding(tt *transit.Timetable, r ride, legIdx int, now time.Time) (following, boarded bool) {
+	if !s.gps.fresh(now) {
+		return false, false
+	}
+	key := s.boardingKey(legIdx)
+	reachedAt, reached := s.gps.reachedStops[key]
+	if !reached {
+		return false, false
+	}
+	seg, ok := shapeBetween(tt, r)
+	if !ok {
+		return false, false
+	}
+	if s.gps.shapeBoard == nil {
+		s.gps.shapeBoard = map[string]*shapeBoardState{}
+	}
+	st := s.gps.shapeBoard[key]
+	if st == nil {
+		st = &shapeBoardState{}
+		s.gps.shapeBoard[key] = st
+	}
+
+	// Replay all not-yet-consumed fresh fixes. This makes the detector robust
+	// when evaluation skipped one or more samples (RT refresh, slow tick).
+	for _, f := range s.gps.hist {
+		if f.At.Before(reachedAt) || !f.At.After(st.lastAt) || now.Sub(f.At) > fixStale {
+			continue
+		}
+		progress, shapeDist, projected := seg.project(tt, f.Lat, f.Lon)
+		corridor := shapeBoardCorridorM + math.Min(f.AccuracyM, fixAccCap)
+		if !projected || shapeDist > corridor {
+			// An incoherent current stream never disables the ordinary stop
+			// guard. Keep the reached-stop latch, but restart shape evidence.
+			*st = shapeBoardState{lastAt: f.At}
+			continue
+		}
+
+		away := distMeters(f.Lat, f.Lon, s.it.Legs[legIdx].From.Lat, s.it.Legs[legIdx].From.Lon)
+		if !st.haveLast || f.At.Sub(st.lastAt) > fixStale {
+			*st = shapeBoardState{
+				lastAt: f.At, lastProgress: progress, evidenceProgress: progress,
+				haveLast: true, onShape: true, awayM: away, accuracyM: f.AccuracyM,
+			}
+			continue
+		}
+
+		delta := progress - st.evidenceProgress
+		if delta < -shapeBoardBacktrackM {
+			// Following the shape in reverse (or a large GPS jump) contradicts
+			// boarding this ride; restart from this fix without losing arrival.
+			*st = shapeBoardState{
+				lastAt: f.At, lastProgress: progress, evidenceProgress: progress,
+				haveLast: true, onShape: true, awayM: away, accuracyM: f.AccuracyM,
+			}
+			continue
+		}
+		if delta >= shapeBoardStepM {
+			if st.movingSince.IsZero() {
+				st.movingSince = st.lastAt
+				st.movingFrom = st.evidenceProgress
+			}
+			st.movingFixes++
+			st.evidenceProgress = progress
+		}
+		st.lastAt = f.At
+		st.lastProgress = progress
+		st.onShape = true
+		st.awayM = away
+		st.accuracyM = f.AccuracyM
+	}
+
+	if !st.onShape || st.movingSince.IsZero() || st.movingFixes == 0 {
+		return false, false
+	}
+	progressed := st.lastProgress - st.movingFrom
+	following = progressed >= shapeBoardProgressM
+	if !following {
+		return false, false
+	}
+	clearAway := st.awayM >= shapeBoardAwayM+math.Min(st.accuracyM, fixAccCap)
+	boarded = clearAway && st.movingFixes >= shapeBoardMovingFixes &&
+		st.lastAt.Sub(st.movingSince) >= shapeBoardHold
+	return following, boarded
 }
 
 // ---- session-level fusion (evidence + timetable + overlay) -----------------
@@ -382,6 +535,7 @@ func (s *session) gpsStopGuard(tt *transit.Timetable, now time.Time) *guardActio
 		return nil
 	}
 	leg := &s.it.Legs[bi]
+	key := s.boardingKey(bi)
 	dep := leg.Depart
 	if lt, ok := s.lastEmit[bi]; ok && !lt.Depart.IsZero() {
 		dep = lt.Depart // RT-adjusted
@@ -390,13 +544,29 @@ func (s *session) gpsStopGuard(tt *transit.Timetable, now time.Time) *guardActio
 	buffer := cfg.Track.BoardBuffer
 
 	if d <= s.gps.radius(nearStopBase) {
-		s.gps.reachedStop = true
+		s.gps.latchReachedStop(key)
+		// Seed/refresh ordered shape progress while the rider is still at the
+		// stop. That preserves a reliable origin even if several fixes arrive
+		// between tracker evaluations just as the vehicle departs.
+		if r, ok := resolveRide(tt, leg); ok {
+			s.gpsShapeBoarding(tt, r, bi, now)
+		}
 		s.gps.tooSlowSince = time.Time{}
 		s.gps.leftStopSince = time.Time{}
 		return nil
 	}
 
-	if s.gps.reachedStop {
+	if _, reached := s.gps.reachedStops[key]; reached {
+		// The rider reached this stop and is now moving in order along the
+		// planned ride's shape. Treat that as an in-progress boarding signal,
+		// not as walking away; advance() promotes it to onboard after the
+		// stronger distance/persistence threshold is met.
+		if r, ok := resolveRide(tt, leg); ok {
+			if following, _ := s.gpsShapeBoarding(tt, r, bi, now); following {
+				s.gps.leftStopSince = time.Time{}
+				return nil
+			}
+		}
 		// AT_STOP, wandered off. Inside the wander radius: waiting, full stop.
 		if d <= cfg.Track.StopWanderRadius+math.Min(s.gps.cur.AccuracyM, fixAccCap) {
 			s.gps.leftStopSince = time.Time{}

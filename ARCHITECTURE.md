@@ -169,17 +169,26 @@ are impossible. Legs carry `realtime` + `delay_s`; the `live=true` filter
 implements the strict rule: first transit leg RT-confirmed and ≤45 min out,
 everything in the next hour RT-covered.
 
+Rail-like modes (GTFS subway/metro, rail, monorail and their extended route
+types) reserve 60 s for first station entry and 90 s for a rail-to-rail
+platform change, including after an in-network footpath. When no fresh
+VehiclePosition exists, protocol 3 marks progress with
+`tracking_source: "schedule_assumed"`: boarding and alighting follow the
+TripUpdate-adjusted clock exactly, user GPS is ignored inside the opaque rail
+block, and a one-shot `position_unavailable` warning explains the handoff.
+
 **Tracking** (`/v1/track`, WebSocket — RFC 6455 hand-rolled, ~180 lines):
 the overlay also carries per-trip vehicle state (position, current pattern
 stop, status) so sessions stream `vehicle` events — where your bus is, how
 many stops away, its delay — before and during the ride, deduped on change.
-no GPS, only clock + feeds. The virtual user walks legs by duration, is
-considered on board once `Passed ≥ boarding position` ("se il GTFS-RT dice
-che è passato, ci fidiamo"), alights the same way. Every RT change (or 5 s
-tick) re-evaluates: feasibility (missed connections — including buses running
+GPS fixes are optional. When present they refine walking progress, latch a
+reached boarding stop, and can confirm boarding from ordered movement along
+the planned shape even if the vehicle feed is late; otherwise the virtual
+rider follows the clock and feeds. Every RT change (or 5 s tick) re-evaluates:
+feasibility (missed connections — including buses running
 *early* — cancellations, skipped stops) forces a replan; opportunistic
 replans fire only when they beat the current arrival by
-`reroute_min_saving` (5 min default, 60 s cooldown). Onboard replans seed
+`reroute_min_saving` (5 min default, 3 min cooldown). Onboard replans seed
 RAPTOR with **every downstream stop** of the current vehicle at its RT
 arrival time, so "get off two stops early and switch" falls out of the same
 search. Schedule-only boardings within `rt_confirm_lead` get a warning and

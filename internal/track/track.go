@@ -35,7 +35,8 @@ type Tracker struct {
 type evHello struct {
 	Type string `json:"type"` // "hello"
 	Mode string `json:"mode"` // "live" | "monitor"
-	// Protocol 2: dual GPS/virtual tracking — the server derives ALL
+	// Protocol 3: dual GPS/virtual tracking plus schedule-assumed rail
+	// segments, signalled additively on progress events. The server derives ALL
 	// stop-related states from streamed positions (or runs pure virtual
 	// when none arrive) and may emit risk / connection_risk / too_slow /
 	// left_stop / stayed_on_vehicle events.
@@ -64,7 +65,8 @@ type evProgress struct {
 	// with client GPS: live meters left to the target of the current phase
 	// (leg endpoint while walking, the boarding stop while waiting).
 	// Pointer: 0 m is meaningful (you are there), absent = no GPS.
-	DistM *int `json:"distance_to_stop_m,omitempty"`
+	DistM          *int   `json:"distance_to_stop_m,omitempty"`
+	TrackingSource string `json:"tracking_source,omitempty"` // schedule_assumed when position is unavailable
 }
 type place struct {
 	StopID string `json:"stop_id"`
@@ -82,7 +84,7 @@ type evReroute struct {
 }
 type evWarning struct {
 	Type     string `json:"type"` // "warning"
-	Code     string `json:"code"` // no_rt_signal | possibly_cancelled
+	Code     string `json:"code"` // no_rt_signal | possibly_cancelled | position_unavailable
 	LegIndex int    `json:"leg_index"`
 	Message  string `json:"message"`
 }
@@ -99,6 +101,7 @@ type evVehicle struct {
 	DelayS    int     `json:"delay_s"`
 	Boarded   bool    `json:"boarded"`
 }
+
 // evDeviation reports a GPS-confirmed departure from the plan; it is always
 // followed by a reroute (same kind as reason) carrying the recovery plan.
 type evDeviation struct {
@@ -123,19 +126,27 @@ type session struct {
 	sink Sink
 	req  engine.Request
 
-	it        engine.Itinerary
-	origArr   time.Time // first promise, for arrive_delta_s
-	liveMode  bool
-	legIdx    int  // first uncompleted leg
-	boarded   bool // for the current transit leg
-	lastEmit  map[int]legTime
-	lastVeh   evVehicle // dedupe for vehicle events
-	lastRR    time.Time // better-arrival reroute cooldown
-	lastTry   time.Time // infeasibility replan attempt throttle
-	warned    map[string]bool
-	arrivedAt time.Time
-	gps       gpsState          // client position evidence (optional)
-	risk      map[int]*riskState // live connection-risk hysteresis, per leg
+	it       engine.Itinerary
+	origArr  time.Time // first promise, for arrive_delta_s
+	liveMode bool
+	legIdx   int  // first uncompleted leg
+	boarded  bool // for the current transit leg
+	// boardedByShape keeps stale vehicle data from triggering opportunistic
+	// replans until the feed catches up with the inferred boarding.
+	boardedByShape bool
+	lastEmit       map[int]legTime
+	lastVeh        evVehicle // dedupe for vehicle events
+	lastRR         time.Time // better-arrival reroute cooldown
+	lastTry        time.Time // infeasibility replan attempt throttle
+	warned         map[string]bool
+	// positionUnavailableWarned survives reroutes: the rider only needs the
+	// rail-position caveat once per tracking session.
+	positionUnavailableWarned bool
+	arrivedAt                 time.Time
+	opaque                    bool               // ignore incoming fixes inside schedule-assumed rail blocks
+	railReadyAt               map[int]time.Time  // fixed station-arrival/change anchors, by outgoing rail leg
+	gps                       gpsState           // client position evidence (optional)
+	risk                      map[int]*riskState // live connection-risk hysteresis, per leg
 }
 
 // Run drives one tracking session until arrival, error or ctx cancellation.
@@ -153,11 +164,12 @@ func (t *Tracker) Run(ctx context.Context, itID string, sink Sink, fixes <-chan 
 		lastEmit: map[int]legTime{}, warned: map[string]bool{},
 		gps: newGPSState(),
 	}
+	s.resetRailReady()
 	mode := "monitor"
 	if s.liveMode {
 		mode = "live"
 	}
-	sink.Send(evHello{"hello", mode, 2, s.it})
+	sink.Send(evHello{"hello", mode, 3, s.it})
 	if done, err := s.evaluate(time.Now()); err == nil && done {
 		sink.Send(evArrived{"arrived", s.arrivedAt})
 		return nil
@@ -184,7 +196,9 @@ func (t *Tracker) Run(ctx context.Context, itID string, sink Sink, fixes <-chan 
 				fixes = nil // client stopped sending: back to virtual-only
 				continue
 			}
-			s.gps.update(f, time.Now())
+			if !s.opaque {
+				s.gps.update(f, time.Now())
+			}
 		}
 		done, err := s.evaluate(time.Now())
 		if err != nil {
@@ -208,6 +222,7 @@ func (s *session) evaluate(now time.Time) (bool, error) {
 	tt := tb.TT
 	o := tt.RT()
 
+	s.ensureCurrentRailReady(tt, now)
 	s.advance(tt, o, now)
 	if s.legIdx >= len(s.it.Legs) {
 		if s.arrivedAt.IsZero() {
@@ -219,32 +234,38 @@ func (s *session) evaluate(now time.Time) (bool, error) {
 	// refresh RT-adjusted times of the remaining plan and check feasibility
 	times, feas := s.refreshTimes(tt, o, now)
 	s.emitDelays(times, now)
-	s.emitVehicle(tt, o)
-	s.emitWalkProgress(tt, now)
+	s.emitVehicle(tt, o, now)
+	opaque := s.opaqueAt(tt, o, now, s.legIdx)
+	s.setOpaque(opaque)
+	if !opaque {
+		s.emitWalkProgress(tt, now)
+	}
 
 	// GPS silence after fixes were flowing: tell the client once and keep
 	// governing with the virtual rider (protocol falls back to virtual).
-	if s.gps.has && now.Sub(s.gps.cur.At) > s.t.Cfg.Track.GPSStaleAfter {
+	if !opaque && s.gps.has && now.Sub(s.gps.cur.At) > s.t.Cfg.Track.GPSStaleAfter {
 		if !s.warned["gps_lost"] {
 			s.warned["gps_lost"] = true
 			s.sink.Send(evWarning{"warning", "gps_lost", s.legIdx,
 				"no recent position fixes; tracking continues on schedule and realtime data only"})
 		}
-	} else if s.gps.fresh(now) {
+	} else if !opaque && s.gps.fresh(now) {
 		s.warned["gps_lost"] = false
 	}
 
 	// GPS-confirmed deviations outrank plan feasibility: the rider already
 	// IS somewhere else, the plan must follow them
-	if dev := s.gpsDeviation(tt, o, now); dev != nil {
-		s.sink.Send(dev.ev)
-		return false, s.reroute(tt, o, now, dev.ev.Kind, dev.ev.Message, 0)
-	}
+	if !opaque {
+		if dev := s.gpsDeviation(tt, o, now); dev != nil {
+			s.sink.Send(dev.ev)
+			return false, s.reroute(tt, o, now, dev.ev.Kind, dev.ev.Message, 0)
+		}
 
-	// proactive stop guard: too slow to reach the boarding stop / walked
-	// away beyond recovery → reroute BEFORE the bus is actually missed
-	if act := s.gpsStopGuard(tt, now); act != nil {
-		return false, s.reroute(tt, o, now, act.reason, act.message, 0)
+		// proactive stop guard: too slow to reach the boarding stop / walked
+		// away beyond recovery → reroute BEFORE the bus is actually missed
+		if act := s.gpsStopGuard(tt, now); act != nil {
+			return false, s.reroute(tt, o, now, act.reason, act.message, 0)
+		}
 	}
 
 	if !feas.ok {
@@ -277,10 +298,37 @@ func (s *session) evaluate(now time.Time) (bool, error) {
 	// more often than once every 3 minutes after ANY reroute, and never
 	// moments before a boarding the rider is already committed to — povero
 	// utente, non si fanno 300 reroute né switch all'ultimo secondo.
-	if now.Sub(s.lastRR) >= betterArrivalCooldown && s.rerouteAllowed(tt) && !s.boardingImminent(now) {
+	if now.Sub(s.lastRR) >= betterArrivalCooldown && !s.boardedByShape && s.rerouteAllowed(tt) &&
+		!s.boardingImminent(now) && !s.shapeBoardingInProgress(tt, now) {
 		s.tryBetterArrival(tt, o, now)
 	}
 	return false, nil
+}
+
+// shapeBoardingInProgress protects the short evidence window between leaving
+// a reached stop along the planned shape and being promoted to riding. During
+// that window neither left_stop nor an opportunistic "better arrival" may
+// replace the ride the user is demonstrably boarding.
+func (s *session) shapeBoardingInProgress(tt *transit.Timetable, now time.Time) bool {
+	if !s.gps.fresh(now) {
+		return false
+	}
+	for i := s.legIdx; i < len(s.it.Legs); i++ {
+		leg := &s.it.Legs[i]
+		if leg.Mode != "transit" {
+			continue
+		}
+		if i == s.legIdx && s.boarded {
+			return false
+		}
+		r, ok := resolveRide(tt, leg)
+		if !ok {
+			return false
+		}
+		following, _ := s.gpsShapeBoarding(tt, r, i, now)
+		return following
+	}
+	return false
 }
 
 // betterArrivalCooldown paces opportunistic reroutes; infeasibility reroutes
@@ -314,24 +362,64 @@ func (s *session) advance(tt *transit.Timetable, o *transit.RTOverlay, now time.
 	for s.legIdx < len(s.it.Legs) {
 		leg := &s.it.Legs[s.legIdx]
 		if leg.Mode != "transit" {
+			// Fast pickup: the rider may reach the boarding stop and leave on
+			// the vehicle before atStopHold has completed the access walk. The
+			// reached-stop latch belongs to the upcoming ride, so shape evidence
+			// can atomically skip the synthetic waiting phase and promote that
+			// ride without letting feasibility report a missed departure first.
+			if s.boardNextRideFromAccessShape(tt, o, now) {
+				return
+			}
 			// GPS: reaching the leg's endpoint early beats the planned clock
 			// (arriving early at a stop only ever helps)
 			atEnd := false
-			if s.gps.fresh(now) {
+			if !s.opaqueAt(tt, o, now, s.legIdx) && s.gps.fresh(now) {
 				near := s.gps.distTo(leg.To.Lat, leg.To.Lon) <= s.gps.radius(nearStopBase)
 				atEnd = hold(&s.gps.nearStopSince, near, now, atStopHold)
 			}
 			if now.After(leg.Arrive) || atEnd {
+				completedAt := leg.Arrive
+				if atEnd {
+					// GPS-confirmed arrival is the real station-entry anchor.
+					// A clock completion keeps the itinerary's absolute arrival so
+					// evaluator cadence never steals buffer time from the rider.
+					completedAt = now
+				}
+				s.anchorRailAfterStreet(tt, s.legIdx, completedAt)
 				s.legIdx++
 				s.boarded = false
+				s.boardedByShape = false
 				s.gps.resetLegAnchors()
-				s.emitPhase() // the client must always know the current leg
+				s.emitPhase(tt, o, now) // the client must always know the current leg
 				continue
 			}
 			return
 		}
 		r, ok := resolveRide(tt, leg)
-		if !ok { // timetable swapped and trip vanished: treat as done by clock
+		if !ok && railLikeLeg(tt, leg) {
+			// A timetable swap may remove the trip while the cached rail leg is
+			// still being tracked. Its itinerary clock remains the safest
+			// schedule assumption; importantly, it has no legacy +90s lag.
+			s.setOpaque(true)
+			s.warnPositionUnavailable()
+			if s.railDepartureTooEarly(s.legIdx, leg.Depart) {
+				return
+			}
+			if !s.boarded {
+				if now.Before(leg.Depart) {
+					return
+				}
+				s.boarded = true
+				s.boardedByShape = false
+				s.sendProgress("riding", s.legIdx, true, "schedule_assumed")
+			}
+			if now.Before(leg.Arrive) {
+				return
+			}
+			s.completeAlight(tt, o, now, leg.Arrive, "schedule_assumed")
+			continue
+		}
+		if !ok { // timetable swapped and road trip vanished: clock fallback
 			if now.After(leg.Arrive.Add(90 * time.Second)) {
 				s.legIdx++
 				continue
@@ -342,17 +430,51 @@ func (s *session) advance(tt *transit.Timetable, o *transit.RTOverlay, now time.
 		depRT := base.Add(time.Duration(tt.TripDep(r.trip, r.board)) * time.Second)
 		arrRT := base.Add(time.Duration(tt.TripArr(r.trip, r.alight)) * time.Second)
 		passed := o.TripPassed(r.trip)
+		assumed := s.scheduleAssumedLeg(tt, o, now, leg)
+		if tt.TripSkipped(r.trip) || tt.StopSkipped(r.trip, r.board) || tt.StopSkipped(r.trip, r.alight) {
+			return // refreshTimes reports and reroutes before virtual progress
+		}
+		if railLikeLeg(tt, leg) && s.railDepartureTooEarly(s.legIdx, depRT) {
+			// refreshTimes emits the missed-connection reason and triggers the
+			// replan. Never promote an impossible schedule-assumed boarding first.
+			return
+		}
+
+		if assumed {
+			s.setOpaque(true)
+			s.warnPositionUnavailable()
+			// The planner already reserved the station-entry/platform-change
+			// margin. With no usable VehiclePosition, board and alight exactly
+			// on the TripUpdate-adjusted clock — never with the generic +90s
+			// virtual-rider lag used for unconfirmed road vehicles.
+			if !s.boarded {
+				if now.Before(depRT) {
+					return
+				}
+				s.boarded = true
+				s.boardedByShape = false
+				s.gps.resetLegAnchors()
+				s.sendProgress("riding", s.legIdx, true, "schedule_assumed")
+			}
+			if now.Before(arrRT) {
+				return
+			}
+			s.completeAlight(tt, o, now, arrRT, "schedule_assumed")
+			continue
+		}
 
 		if !s.boarded {
+			_, shapeBoarded := s.gpsShapeBoarding(tt, r, s.legIdx, now)
 			// GPS: sustained co-location with the tracked vehicle confirms
 			// boarding before the feed's Passed does — but only once the
 			// vehicle is confirmedly past the boarding stop: standing at the
 			// stop next to a dwelling bus must never count as being on it
-			if passed >= int16(r.board) || (passed < 0 && now.After(depRT.Add(90*time.Second))) ||
+			if shapeBoarded || passed >= int16(r.board) || (passed < 0 && now.After(depRT.Add(90*time.Second))) ||
 				(s.vehicleBeyond(tt, o, r, int(r.board)) && s.gpsWithVehicle(tt, o, r, now, confirmOn)) {
 				s.boarded = true
+				s.boardedByShape = shapeBoarded
 				s.gps.resetLegAnchors()
-				s.sink.Send(evProgress{Type: "progress", Status: "riding", LegIndex: s.legIdx, Boarded: true})
+				s.sendProgress("riding", s.legIdx, true, "")
 			} else {
 				return // still waiting at the stop
 			}
@@ -371,34 +493,45 @@ func (s *session) advance(tt *transit.Timetable, o *transit.RTOverlay, now time.
 			if !gpsAlighted && s.gpsWithVehicle(tt, o, r, now, 0) {
 				return
 			}
-			s.legIdx++
-			s.boarded = false
-			s.gps.resetLegAnchors()
-			s.sink.Send(evProgress{Type: "progress", Status: "alighted", LegIndex: s.legIdx - 1})
-			// unless GPS says otherwise the rider got off where we told them:
-			// hand over to the next phase EXPLICITLY, so the client can start
-			// turn-by-turn toward the next stop instead of hanging on "alight"
-			s.emitPhase()
-			// the vehicle may have run early/late: re-anchor the following
-			// street leg to the actual alighting moment
-			if s.legIdx < len(s.it.Legs) && s.it.Legs[s.legIdx].Mode != "transit" {
-				nl := &s.it.Legs[s.legIdx]
-				at := arrRT
-				if now.After(at) {
-					at = now
-				}
-				dur := time.Duration(nl.DurationS) * time.Second
-				nl.Depart, nl.Arrive = at, at.Add(dur)
-			}
+			s.completeAlight(tt, o, now, arrRT, "")
 			continue
 		}
 		return // riding
 	}
 }
 
+// boardNextRideFromAccessShape handles a vehicle that picks the rider up
+// during the short persistence window which still leaves the access walk as
+// the current leg. Only an immediately following, normally GPS-trackable ride
+// is eligible; schedule-assumed rail keeps its dedicated clock semantics.
+func (s *session) boardNextRideFromAccessShape(tt *transit.Timetable, o *transit.RTOverlay, now time.Time) bool {
+	next := s.legIdx + 1
+	if next >= len(s.it.Legs) || s.it.Legs[next].Mode != "transit" || !s.gps.fresh(now) {
+		return false
+	}
+	leg := &s.it.Legs[next]
+	if s.scheduleAssumedLeg(tt, o, now, leg) {
+		return false
+	}
+	r, ok := resolveRide(tt, leg)
+	if !ok {
+		return false
+	}
+	_, shapeBoarded := s.gpsShapeBoarding(tt, r, next, now)
+	if !shapeBoarded {
+		return false
+	}
+	s.legIdx = next
+	s.boarded = true
+	s.boardedByShape = true
+	s.gps.resetLegAnchors()
+	s.sendProgress("riding", next, true, "")
+	return true
+}
+
 // emitPhase tells the client which leg is now current and in which phase —
 // sent at every leg transition so the UI is never left guessing.
-func (s *session) emitPhase() {
+func (s *session) emitPhase(tt *transit.Timetable, o *transit.RTOverlay, now time.Time) {
 	if s.legIdx >= len(s.it.Legs) {
 		return
 	}
@@ -406,7 +539,250 @@ func (s *session) emitPhase() {
 	if s.it.Legs[s.legIdx].Mode == "transit" {
 		status = "waiting"
 	}
-	s.sink.Send(evProgress{Type: "progress", Status: status, LegIndex: s.legIdx, Boarded: s.boarded})
+	source := ""
+	if s.opaqueAt(tt, o, now, s.legIdx) {
+		source = "schedule_assumed"
+		s.warnPositionUnavailable()
+	}
+	s.sendProgress(status, s.legIdx, s.boarded, source)
+}
+
+func (s *session) sendProgress(status string, legIdx int, boarded bool, source string) {
+	s.sink.Send(evProgress{
+		Type: "progress", Status: status, LegIndex: legIdx, Boarded: boarded,
+		TrackingSource: source,
+	})
+}
+
+// completeAlight advances from a transit leg and re-anchors the following
+// walking phase to the actual (possibly TripUpdate-adjusted) arrival.
+func (s *session) completeAlight(tt *transit.Timetable, o *transit.RTOverlay, now, arrRT time.Time, source string) {
+	completed := s.legIdx
+	s.anchorRailAfterAlight(tt, completed, arrRT)
+	s.legIdx++
+	s.boarded = false
+	s.boardedByShape = false
+	s.gps.resetLegAnchors()
+	s.sendProgress("alighted", completed, false, source)
+	// The handoff is explicit so clients never hang on the alight phase.
+	s.emitPhase(tt, o, now)
+	if s.legIdx < len(s.it.Legs) && s.it.Legs[s.legIdx].Mode != "transit" {
+		nl := &s.it.Legs[s.legIdx]
+		at := arrRT
+		if now.After(at) {
+			at = now
+		}
+		dur := time.Duration(nl.DurationS) * time.Second
+		nl.Depart, nl.Arrive = at, at.Add(dur)
+	}
+}
+
+// resetRailReady starts a fresh per-plan set of immutable readiness anchors.
+// BoardReadyAt is only present when an onboard replan starts after an incoming
+// rail ride that is intentionally absent from the replacement itinerary.
+func (s *session) resetRailReady() {
+	s.railReadyAt = map[int]time.Time{}
+	for i := range s.it.Legs {
+		if at := s.it.Legs[i].BoardReadyAt; !at.IsZero() {
+			s.railReadyAt[i] = at
+		}
+	}
+}
+
+func (s *session) setRailReady(idx int, at time.Time) {
+	if idx < 0 || idx >= len(s.it.Legs) || at.IsZero() {
+		return
+	}
+	if s.railReadyAt == nil {
+		s.railReadyAt = map[int]time.Time{}
+	}
+	if _, fixed := s.railReadyAt[idx]; !fixed {
+		s.railReadyAt[idx] = at
+	}
+}
+
+func (s *session) ensureCurrentRailReady(tt *transit.Timetable, now time.Time) {
+	if s.boarded || s.legIdx < 0 || s.legIdx >= len(s.it.Legs) ||
+		!railLikeLeg(tt, &s.it.Legs[s.legIdx]) {
+		return
+	}
+	if _, fixed := s.railReadyAt[s.legIdx]; fixed {
+		return
+	}
+	// Normal plans install this when their access/transfer leg completes, and
+	// onboard plans carry BoardReadyAt. This fallback covers legacy cached or
+	// hand-built itineraries without turning "now + 60s" into a sliding timer.
+	s.setRailReady(s.legIdx, now.Add(s.railEntryBuffer()))
+}
+
+func (s *session) railDepartureTooEarly(idx int, depart time.Time) bool {
+	ready, ok := s.railReadyAt[idx]
+	return ok && depart.Before(ready)
+}
+
+func (s *session) railEntryBuffer() time.Duration {
+	if s.t != nil && s.t.Cfg != nil {
+		return s.t.Cfg.Routing.RailEntryBuffer
+	}
+	return time.Minute
+}
+
+func (s *session) railTransferBuffer() time.Duration {
+	if s.t != nil && s.t.Cfg != nil {
+		return s.t.Cfg.Routing.RailTransferBuffer
+	}
+	return 90 * time.Second
+}
+
+func (s *session) nextTransitIndex(from int) int {
+	for i := from; i < len(s.it.Legs); i++ {
+		if s.it.Legs[i].Mode == "transit" {
+			return i
+		}
+	}
+	return -1
+}
+
+// anchorRailAfterStreet applies the one-minute station-entry allowance from
+// the actual GPS arrival (or the stable virtual arrival). A rail-to-rail
+// anchor is installed earlier, at alighting, because its 90 seconds include
+// the intervening footpath rather than starting after it.
+func (s *session) anchorRailAfterStreet(tt *transit.Timetable, streetIdx int, arrived time.Time) {
+	next := streetIdx + 1
+	if next >= len(s.it.Legs) || !railLikeLeg(tt, &s.it.Legs[next]) {
+		return
+	}
+	if _, fixed := s.railReadyAt[next]; fixed {
+		return
+	}
+	for i := streetIdx - 1; i >= 0; i-- {
+		if s.it.Legs[i].Mode != "transit" {
+			continue
+		}
+		if railLikeLeg(tt, &s.it.Legs[i]) {
+			// Defensive fallback for cached/legacy itineraries. New sessions
+			// receive the precise RT-adjusted anchor in completeAlight.
+			s.setRailReady(next, s.it.Legs[i].Arrive.Add(s.railTransferBuffer()))
+			return
+		}
+		break
+	}
+	s.setRailReady(next, arrived.Add(s.railEntryBuffer()))
+}
+
+// anchorRailAfterAlight starts a rail-to-rail change at the incoming train's
+// actual/assumed arrival. The fixed target survives its walking leg and later
+// RT refreshes, so the 90-second margin cannot slide on every evaluator tick.
+func (s *session) anchorRailAfterAlight(tt *transit.Timetable, completed int, arrived time.Time) {
+	if completed < 0 || completed >= len(s.it.Legs) {
+		return
+	}
+	next := s.nextTransitIndex(completed + 1)
+	if next < 0 || !railLikeLeg(tt, &s.it.Legs[next]) {
+		return
+	}
+	if railLikeLeg(tt, &s.it.Legs[completed]) {
+		s.setRailReady(next, arrived.Add(s.railTransferBuffer()))
+		return
+	}
+	// With no street leg between a bus and rail, station entry begins at the
+	// alight itself. Otherwise the intervening walk installs the anchor.
+	if next == completed+1 {
+		s.setRailReady(next, arrived.Add(s.railEntryBuffer()))
+	}
+}
+
+const vehiclePositionMaxAge = 5 * time.Minute
+
+// scheduleAssumedLeg identifies a rail-like ride without a usable fresh
+// VehiclePosition. TripUpdates are intentionally irrelevant to this choice:
+// they still adjust TripDep/TripArr and therefore the assumed clock.
+func (s *session) scheduleAssumedLeg(tt *transit.Timetable, o *transit.RTOverlay, now time.Time, leg *engine.Leg) bool {
+	if !railLikeLeg(tt, leg) {
+		return false
+	}
+	r, ok := resolveRide(tt, leg)
+	if !ok || o == nil {
+		return true
+	}
+	if _, _, _, _, ok := o.Vehicle(r.trip); !ok {
+		return true
+	}
+	stamp := o.VehicleTime(r.trip)
+	if stamp == 0 {
+		// Production overlays substitute the persisted feed-receipt time. A
+		// zero here can only be an unverifiable hand-built/legacy overlay, which
+		// must fail closed rather than remain fresh forever.
+		return true
+	}
+	return now.Sub(time.Unix(int64(stamp), 0)) > vehiclePositionMaxAge
+}
+
+func railLikeLeg(tt *transit.Timetable, leg *engine.Leg) bool {
+	if leg == nil || leg.Mode != "transit" {
+		return false
+	}
+	if leg.Route != nil {
+		return transit.IsRailLikeRouteType(leg.Route.Type)
+	}
+	r, ok := resolveRide(tt, leg)
+	if !ok {
+		return false
+	}
+	pattern := tt.PatternOfTrip(r.trip)
+	route := tt.PatRoute[pattern]
+	return route >= 0 && int(route) < len(tt.Routes) && transit.IsRailLikeRouteType(tt.Routes[route].Type)
+}
+
+// opaqueAt spans a schedule-assumed rail ride and an in-station walking
+// transfer between rail rides. User GPS is deliberately ignored throughout
+// this block: an absent/jittering underground fix is not evidence of a
+// deviation and must not trigger a stop guard or gps_lost warning.
+func (s *session) opaqueAt(tt *transit.Timetable, o *transit.RTOverlay, now time.Time, idx int) bool {
+	if idx < 0 || idx >= len(s.it.Legs) {
+		return false
+	}
+	if s.it.Legs[idx].Mode == "transit" {
+		return s.scheduleAssumedLeg(tt, o, now, &s.it.Legs[idx])
+	}
+	prev, next := -1, -1
+	for i := idx - 1; i >= 0; i-- {
+		if s.it.Legs[i].Mode == "transit" {
+			prev = i
+			break
+		}
+	}
+	for i := idx + 1; i < len(s.it.Legs); i++ {
+		if s.it.Legs[i].Mode == "transit" {
+			next = i
+			break
+		}
+	}
+	if prev < 0 || next < 0 || !railLikeLeg(tt, &s.it.Legs[prev]) || !railLikeLeg(tt, &s.it.Legs[next]) {
+		return false
+	}
+	return s.scheduleAssumedLeg(tt, o, now, &s.it.Legs[prev]) ||
+		s.scheduleAssumedLeg(tt, o, now, &s.it.Legs[next])
+}
+
+func (s *session) warnPositionUnavailable() {
+	if s.positionUnavailableWarned {
+		return
+	}
+	s.positionUnavailableWarned = true
+	s.sink.Send(evWarning{
+		Type: "warning", Code: "position_unavailable", LegIndex: s.legIdx,
+		Message: "You're entering a section where your position may be unavailable. Guidance will continue automatically using the timetable and realtime service updates.",
+	})
+}
+
+func (s *session) setOpaque(opaque bool) {
+	if opaque && !s.opaque {
+		// A pre-entry fix must never reappear as "current" at the far end of
+		// the tunnel, and fixes received while opaque are discarded by Run.
+		s.gps = newGPSState()
+	}
+	s.opaque = opaque
 }
 
 // feasibility of the remaining plan
@@ -421,22 +797,40 @@ func (s *session) refreshTimes(tt *transit.Timetable, o *transit.RTOverlay, now 
 	var out []legTime
 	feas := feasibility{ok: true}
 	cursor := now
+	var priorTransit, priorRail bool
+	var priorRailArr time.Time
 	for i := s.legIdx; i < len(s.it.Legs); i++ {
 		leg := &s.it.Legs[i]
 		if leg.Mode != "transit" {
 			dur := time.Duration(leg.DurationS) * time.Second
-			dep := cursor
-			if i == s.legIdx && now.Before(leg.Depart) {
-				dep = leg.Depart // not started yet per plan
+			if i == s.legIdx {
+				// The current street leg already started: its original arrival is
+				// an absolute countdown anchor. Re-adding the full duration at
+				// every tick made the ETA slide forward forever.
+				dep, arrive := leg.Depart, leg.Arrive
+				if now.Before(dep) {
+					arrive = dep.Add(dur)
+				} else if arrive.Before(now) {
+					arrive = now
+				}
+				cursor = arrive
+				out = append(out, legTime{Index: i, Depart: dep, Arrive: arrive})
+				continue
 			}
+			dep := cursor
 			cursor = dep.Add(dur)
 			out = append(out, legTime{Index: i, Depart: dep, Arrive: cursor})
 			continue
 		}
 		r, ok := resolveRide(tt, leg)
 		if !ok {
+			if railLikeLeg(tt, leg) && !(i == s.legIdx && s.boarded) &&
+				s.railDepartureTooEarly(i, leg.Depart) && feas.ok {
+				feas = feasibility{false, "missed_connection", "not enough time remains to enter or change rail service"}
+			}
 			out = append(out, legTime{Index: i, Depart: leg.Depart, Arrive: leg.Arrive})
 			cursor = leg.Arrive
+			priorTransit, priorRail, priorRailArr = true, railLikeLeg(tt, leg), leg.Arrive
 			continue
 		}
 		if tt.TripSkipped(r.trip) {
@@ -453,6 +847,29 @@ func (s *session) refreshTimes(tt *transit.Timetable, o *transit.RTOverlay, now 
 		if i == s.legIdx && s.boarded {
 			// already on it: only the arrival matters
 		} else {
+			ready := cursor
+			if railLikeLeg(tt, leg) {
+				if fixed, ok := s.railReadyAt[i]; ok {
+					if fixed.After(ready) {
+						ready = fixed
+					}
+				} else if priorTransit && priorRail {
+					if changeReady := priorRailArr.Add(s.railTransferBuffer()); changeReady.After(ready) {
+						ready = changeReady
+					}
+				} else if i == s.legIdx {
+					// A direct/legacy rail itinerary has no preceding street leg
+					// from which to capture arrival. Anchor once now; never rebuild
+					// this deadline on later ticks.
+					s.setRailReady(i, now.Add(s.railEntryBuffer()))
+					ready = s.railReadyAt[i]
+				} else {
+					ready = ready.Add(s.railEntryBuffer())
+				}
+				if feas.ok && depRT.Before(ready) {
+					feas = feasibility{false, "missed_connection", "not enough time remains to enter or change rail service"}
+				}
+			}
 			// A connection counts as missed ONLY when GTFS-RT confirms the
 			// vehicle already cleared the boarding stop before the rider
 			// could be there. Predicted departures are not enough: near the
@@ -460,7 +877,7 @@ func (s *session) refreshTimes(tt *transit.Timetable, o *transit.RTOverlay, now 
 			// propagated) the clock slides past the scheduled time and a
 			// prediction-based check produces false "missed_connection"
 			// reroutes for a bus that has not even left.
-			if feas.ok && cursor.After(depRT) && o.TripPassed(r.trip) >= int16(r.board) {
+			if feas.ok && ready.After(depRT) && o.TripPassed(r.trip) >= int16(r.board) {
 				feas = feasibility{false, "missed_connection", "your connection already left its stop"}
 			}
 			if depRT.After(cursor) {
@@ -468,6 +885,9 @@ func (s *session) refreshTimes(tt *transit.Timetable, o *transit.RTOverlay, now 
 			}
 		}
 		cursor = arrRT
+		priorTransit = true
+		priorRail = railLikeLeg(tt, leg)
+		priorRailArr = arrRT
 		out = append(out, legTime{Index: i, Depart: depRT, Arrive: arrRT,
 			DelayS: delay, Realtime: o.TripHasRT(r.trip)})
 	}
@@ -477,11 +897,14 @@ func (s *session) refreshTimes(tt *transit.Timetable, o *transit.RTOverlay, now 
 // emitVehicle streams the live position of the bus/train the user rides or
 // is about to board: where it is, which stop it is at/approaching, how many
 // stops from the user, and its delay — even before the user is on it.
-func (s *session) emitVehicle(tt *transit.Timetable, o *transit.RTOverlay) {
+func (s *session) emitVehicle(tt *transit.Timetable, o *transit.RTOverlay, now time.Time) {
 	for i := s.legIdx; i < len(s.it.Legs); i++ {
 		leg := &s.it.Legs[i]
 		if leg.Mode != "transit" {
 			continue
+		}
+		if s.scheduleAssumedLeg(tt, o, now, leg) {
+			return // never expose a stale rail position during clock-based guidance
 		}
 		r, ok := resolveRide(tt, leg)
 		if !ok {
@@ -489,7 +912,7 @@ func (s *session) emitVehicle(tt *transit.Timetable, o *transit.RTOverlay) {
 		}
 		lat, lon, pos, status, ok := o.Vehicle(r.trip)
 		if !ok {
-			return // no vehicle entity for this trip (metro etc.)
+			return // no vehicle entity for this trip (rail-like services etc.)
 		}
 		stops := tt.PatternStops(tt.PatternOfTrip(r.trip))
 		ev := evVehicle{
@@ -567,8 +990,8 @@ func (s *session) scheduleGuard(tt *transit.Timetable, o *transit.RTOverlay, now
 		if leg.Mode != "transit" || (i == s.legIdx && s.boarded) {
 			continue
 		}
-		if leg.Route != nil && engine.IsMetroType(leg.Route.Type) {
-			continue // metro: always considered live, never emits RT entities
+		if leg.Route != nil && engine.IsRailLikeType(leg.Route.Type) {
+			continue // rail-like: eligible for schedule-assumed tracking
 		}
 		r, ok := resolveRide(tt, leg)
 		if !ok || o.TripHasRT(r.trip) {
@@ -603,8 +1026,8 @@ func (s *session) rerouteAllowed(tt *transit.Timetable) bool {
 	for i := s.legIdx; i < len(s.it.Legs); i++ {
 		leg := &s.it.Legs[i]
 		if leg.Mode == "transit" {
-			if leg.Route != nil && engine.IsMetroType(leg.Route.Type) {
-				return true // metro counts as live ground
+			if leg.Route != nil && engine.IsRailLikeType(leg.Route.Type) {
+				return true // rail-like service counts as live ground
 			}
 			r, ok := resolveRide(tt, leg)
 			return ok && tt.RT().TripHasRT(r.trip)
@@ -674,10 +1097,13 @@ func (s *session) switchTo(it engine.Itinerary, reason, msg string, saving int) 
 	s.it = it
 	s.legIdx = 0
 	s.boarded = false
+	s.boardedByShape = false
 	s.lastEmit = map[int]legTime{}
 	s.lastVeh = evVehicle{}
 	s.warned = map[string]bool{} // fresh plan, fresh guard state
 	s.risk = map[int]*riskState{}
+	s.opaque = false
+	s.resetRailReady()
 	s.gps.resetLegAnchors()
 	s.gps.deviated = map[string]bool{} // fresh plan, fresh deviation slate
 	s.liveMode = it.Live || s.liveMode
@@ -748,13 +1174,17 @@ func (s *session) replan(tt *transit.Timetable, o *transit.RTOverlay, now time.T
 			if tt.StopSkipped(r.trip, uint16(pos)) {
 				continue
 			}
-			at := base.Add(time.Duration(tt.TripArr(r.trip, uint16(pos)))*time.Second + 15*time.Second)
+			at := base.Add(time.Duration(tt.TripArr(r.trip, uint16(pos))) * time.Second)
 			if at.Before(now) {
 				continue
 			}
 			seeds[stops[pos]] = at
 		}
-		its, err := s.t.E.PlanFromStops(seeds, dLat, dLon, now, 3)
+		source := engine.StopPlanSource{
+			PriorRail:  railLikeLeg(tt, leg),
+			ReadySlack: 15 * time.Second,
+		}
+		its, err := s.t.E.PlanFromStops(seeds, dLat, dLon, now, 3, source)
 		if err != nil || len(its) == 0 {
 			// no ride works from the downstream stops (e.g. end of the line,
 			// destination already behind): walking from here may still

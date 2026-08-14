@@ -127,12 +127,17 @@ type Config struct {
 		WalkSpeedKmh float64
 		BikeSpeedKmh float64
 
-		MaxWalkAccess   time.Duration // max walk to/from a stop
-		MaxBikeAccess   time.Duration // max ride to/from a stop (bike+transit)
-		MaxTransfers    int
-		TransferSlack   time.Duration // minimum time to change vehicles
-		TransferRadiusM int           // stop-to-stop footpath precompute radius (network meters)
-		SnapRadiusM     int           // max distance from a point to the street graph
+		MaxWalkAccess time.Duration // max walk to/from a stop
+		MaxBikeAccess time.Duration // max ride to/from a stop (bike+transit)
+		MaxTransfers  int
+		TransferSlack time.Duration // minimum time to change vehicles
+		// RailEntryBuffer is the time needed to enter a station before the
+		// first rail-like boarding. RailTransferBuffer is the platform-change
+		// margin between rail-like rides, including after a walking footpath.
+		RailEntryBuffer    time.Duration
+		RailTransferBuffer time.Duration
+		TransferRadiusM    int // stop-to-stop footpath precompute radius (network meters)
+		SnapRadiusM        int // max distance from a point to the street graph
 
 		// bike+transit realism: a bike access/egress variant is only offered
 		// if it beats the walk-based plan by at least this much.
@@ -172,6 +177,8 @@ func Default() *Config {
 	c.Routing.MaxBikeAccess = 18 * time.Minute
 	c.Routing.MaxTransfers = 4
 	c.Routing.TransferSlack = 90 * time.Second
+	c.Routing.RailEntryBuffer = time.Minute
+	c.Routing.RailTransferBuffer = 90 * time.Second
 	c.Routing.TransferRadiusM = 400
 	c.Routing.SnapRadiusM = 300
 	c.Routing.BikeTransitMinSaving = 5 * time.Minute
@@ -332,6 +339,12 @@ func parse(data []byte) (*Config, error) {
 	if c.Routing.TransferSlack, err = r.Dur("transfer_slack", c.Routing.TransferSlack); err != nil {
 		return nil, err
 	}
+	if c.Routing.RailEntryBuffer, err = r.Dur("rail_entry_buffer", c.Routing.RailEntryBuffer); err != nil {
+		return nil, err
+	}
+	if c.Routing.RailTransferBuffer, err = r.Dur("rail_transfer_buffer", c.Routing.RailTransferBuffer); err != nil {
+		return nil, err
+	}
 	c.Routing.TransferRadiusM = int(r.Int("transfer_radius_m", int64(c.Routing.TransferRadiusM)))
 	c.Routing.SnapRadiusM = int(r.Int("snap_radius_m", int64(c.Routing.SnapRadiusM)))
 	if c.Routing.BikeTransitMinSaving, err = r.Dur("bike_transit_min_saving", c.Routing.BikeTransitMinSaving); err != nil {
@@ -389,6 +402,9 @@ func validate(c *Config) error {
 	}
 	if c.Routing.MaxTransfers < 0 || c.Routing.MaxTransfers > 8 {
 		return fmt.Errorf("config: max_transfers must be between 0 and 8")
+	}
+	if c.Routing.RailEntryBuffer < 0 || c.Routing.RailTransferBuffer < 0 {
+		return fmt.Errorf("config: rail entry and transfer buffers cannot be negative")
 	}
 	return nil
 }

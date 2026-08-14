@@ -4,12 +4,19 @@ import (
 	"time"
 )
 
-// StopSeed seeds RAPTOR: for sources, Sec is the arrival time at the stop
-// (seconds since query-date midnight, access walk included); for targets,
-// Sec is the egress cost from the stop to the destination.
+// StopSeed seeds RAPTOR: for sources, Sec is the time the rider is ready at
+// the stop (seconds since query-date midnight, access walk included); for
+// targets, Sec is the egress cost from the stop to the destination.
+//
+// PriorRailArrSec is meaningful when PriorRail is true: it is the actual
+// arrival of the rail vehicle which produced this source. Keeping it separate
+// from Sec lets a replan retain a small alighting/readiness allowance for bus
+// boardings while measuring a following rail transfer from the true arrival.
 type StopSeed struct {
-	Stop int32
-	Sec  uint32
+	Stop            int32
+	Sec             uint32
+	PriorRail       bool
+	PriorRailArrSec uint32
 }
 
 // Query is one earliest-arrival RAPTOR run.
@@ -22,6 +29,12 @@ type Query struct {
 	PrevWeekday  time.Weekday
 	MaxTransfers int
 	SlackSec     uint32 // minimum vehicle-change time
+	// RailEntrySec is the station-entry margin before the first rail-like
+	// ride. RailTransferSec is the platform-change margin when both the
+	// incoming and outgoing rides are rail-like. Unlike SlackSec, the rail
+	// margins also apply after an in-network walking transfer.
+	RailEntrySec    uint32
+	RailTransferSec uint32
 }
 
 // Journey is one pareto-optimal result (per number of rides).
@@ -69,6 +82,11 @@ type Raptor struct {
 	markList []int32
 	patMin   []int32
 	patList  []uint32
+
+	// sourceRail marks round-zero labels seeded by an incoming rail ride.
+	// sourceRailArr is its actual arrival, before any ready-time allowance.
+	sourceRail    []bool
+	sourceRailArr []uint32
 }
 
 // NewRaptor allocates state for tt.
@@ -78,6 +96,8 @@ func NewRaptor(tt *Timetable) *Raptor {
 	r.tauBest = make([]uint32, n)
 	r.marked = make([]bool, n)
 	r.patMin = make([]int32, tt.NumPatterns())
+	r.sourceRail = make([]bool, n)
+	r.sourceRailArr = make([]uint32, n)
 	for i := range r.patMin {
 		r.patMin[i] = -1
 	}
@@ -110,6 +130,8 @@ func (r *Raptor) Plan(q Query) []Journey {
 		r.tau[0][i] = inf
 	}
 	clear(r.kind[0])
+	clear(r.sourceRail)
+	clear(r.sourceRailArr)
 	r.markList = r.markList[:0]
 
 	targetExtra := map[int32]uint32{}
@@ -124,9 +146,38 @@ func (r *Raptor) Plan(q Query) []Journey {
 			r.tau[0][s.Stop] = s.Sec
 			r.tauBest[s.Stop] = s.Sec
 			r.kind[0][s.Stop] = pkAccess
+			r.sourceRail[s.Stop] = s.PriorRail
+			r.sourceRailArr[s.Stop] = s.PriorRailArrSec
 			if !r.marked[s.Stop] {
 				r.marked[s.Stop] = true
 				r.markList = append(r.markList, s.Stop)
+			}
+		}
+	}
+
+	// An onboard rail replan can alight at one platform/stop and reach the
+	// first candidate service through an in-station footpath before taking a
+	// new ride. Seed that one-hop transfer in round zero and retain its parent:
+	// rail transfer time is still measured from the incoming train's arrival,
+	// not from the end of this walk.
+	initialSources := append([]int32(nil), r.markList...)
+	for _, from := range initialSources {
+		if r.kind[0][from] != pkAccess || !r.sourceRail[from] {
+			continue
+		}
+		base := r.tau[0][from]
+		tos, dss := tt.Transfers(from)
+		for i, to := range tos {
+			cand := base + uint32(dss[i])/10 + uint32(dss[i])%10/5
+			if cand < r.tau[0][to] && cand < r.tauBest[to] {
+				r.tau[0][to] = cand
+				r.tauBest[to] = cand
+				r.kind[0][to] = pkXfer
+				r.pfrom[0][to] = from
+				if !r.marked[to] {
+					r.marked[to] = true
+					r.markList = append(r.markList, to)
+				}
 			}
 		}
 	}
@@ -284,8 +335,42 @@ func (r *Raptor) scanPattern(q Query, k int, p uint32, startPos uint16, active [
 		if rt >= inf {
 			continue
 		}
+		wait := uint32(0)
 		if r.kind[k-1][s] == pkRide {
-			rt += q.SlackSec
+			wait = q.SlackSec
+		}
+		if r.patternRailLike(p) {
+			if priorArr, ok := r.priorRailSource(k-1, s); ok {
+				// Onboard replans seed a ready time (normally arrival+15s),
+				// but rail→rail transfer time is measured from the incoming
+				// vehicle's actual arrival, including across a source footpath.
+				// A bus does not enter this branch and keeps only ready time.
+				ready := priorArr + q.RailTransferSec
+				if ready < priorArr { // uint32 overflow guard
+					ready = inf
+				}
+				if ready > rt && ready-rt > wait {
+					wait = ready - rt
+				}
+			} else if prior, priorArr, ok := r.priorRide(k-1, s); ok && r.tripRailLike(prior) {
+				// A station footpath is part of the change, not extra to it:
+				// require at least RailTransferSec from the incoming arrival,
+				// while retaining a longer real walk when one was necessary.
+				ready := priorArr + q.RailTransferSec
+				if ready < priorArr { // uint32 overflow guard
+					ready = inf
+				}
+				if ready > rt && ready-rt > wait {
+					wait = ready - rt
+				}
+			} else if q.RailEntrySec > wait {
+				wait = q.RailEntrySec
+			}
+		}
+		if wait >= inf-rt {
+			rt = inf
+		} else {
+			rt += wait
 		}
 		usable := func(t int64) bool {
 			return ServiceActive(active, tt.TripService[t]) && !tt.TripSkipped(uint32(t))
@@ -323,6 +408,51 @@ func (r *Raptor) scanPattern(q Query, k int, p uint32, startPos uint16, active [
 			}
 		}
 	}
+}
+
+// priorRailSource resolves a round-zero source produced by an incoming rail
+// ride, following the optional one-hop in-station footpath parent.
+func (r *Raptor) priorRailSource(k int, stop int32) (arrived uint32, ok bool) {
+	for hops := 0; hops < 2 && stop >= 0; hops++ {
+		switch r.kind[k][stop] {
+		case pkAccess:
+			if r.sourceRail[stop] {
+				return r.sourceRailArr[stop], true
+			}
+			return 0, false
+		case pkXfer:
+			stop = r.pfrom[k][stop]
+		default:
+			return 0, false
+		}
+	}
+	return 0, false
+}
+
+// priorRide returns the ride that produced a label. A walking transfer keeps
+// the same RAPTOR round, so following pkXfer's parent retains the incoming
+// mode across that footpath.
+func (r *Raptor) priorRide(k int, stop int32) (trip uint32, arrived uint32, ok bool) {
+	for hops := 0; hops < 2 && stop >= 0; hops++ {
+		switch r.kind[k][stop] {
+		case pkRide:
+			return r.ptrip[k][stop], r.tau[k][stop], true
+		case pkXfer:
+			stop = r.pfrom[k][stop]
+		default:
+			return 0, 0, false
+		}
+	}
+	return 0, 0, false
+}
+
+func (r *Raptor) patternRailLike(pattern uint32) bool {
+	route := r.tt.PatRoute[pattern]
+	return route >= 0 && int(route) < len(r.tt.Routes) && IsRailLikeRouteType(r.tt.Routes[route].Type)
+}
+
+func (r *Raptor) tripRailLike(trip uint32) bool {
+	return r.patternRailLike(r.tt.PatternOfTrip(trip))
 }
 
 func addDay(sec uint32, off int32) uint32 {

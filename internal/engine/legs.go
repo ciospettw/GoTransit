@@ -14,17 +14,39 @@ func (e *Engine) assemble(gb *GraphBundle, tb *TTBundle, j transit.Journey, base
 	fLat, fLon, tLat, tLon int32, acc, egr *accessSet) (Itinerary, bool) {
 
 	tt := tb.TT
-	if len(j.Legs) == 0 || !j.Legs[0].Ride {
+	if len(j.Legs) == 0 {
+		return Itinerary{}, false
+	}
+	firstRide := -1
+	for i := range j.Legs {
+		if j.Legs[i].Ride {
+			firstRide = i
+			break
+		}
+	}
+	if firstRide < 0 {
 		return Itinerary{}, false
 	}
 	var legs []Leg
 	sig := ""
 
 	// --- access leg: origin → first boarding stop ---
-	firstPat := j.Legs[0].Pattern
+	firstPat := j.Legs[firstRide].Pattern
 	firstStops := tt.PatternStops(firstPat)
-	boardStop := firstStops[j.Legs[0].Board]
-	accSec, okA := acc.sec[boardStop]
+	boardStop := firstStops[j.Legs[firstRide].Board]
+	sourceStop := boardStop
+	if firstRide > 0 {
+		sourceStop = j.Legs[0].From
+	}
+	var initialRailReady time.Time
+	if acc.mode == "none" {
+		if priorArr, ok := acc.priorRailArr[sourceStop]; ok {
+			initialRailReady = base.Add(time.Duration(priorArr)*time.Second + e.Cfg.Routing.RailTransferBuffer)
+		} else if readySec, ok := acc.sec[sourceStop]; ok {
+			initialRailReady = base.Add(time.Duration(readySec)*time.Second + e.Cfg.Routing.RailEntryBuffer)
+		}
+	}
+	accSec, okA := acc.sec[sourceStop]
 	if !okA {
 		return Itinerary{}, false
 	}
@@ -36,6 +58,7 @@ func (e *Engine) assemble(gb *GraphBundle, tb *TTBundle, j transit.Journey, base
 		accessLeg.DurationS = int(accSec)
 		accessLeg.From = Place{Lat: e7f(fLat), Lon: e7f(fLon)}
 		accessLeg.To = stopPlace(tt, boardStop)
+		reconcileLegSteps(&accessLeg)
 		legs = append(legs, accessLeg)
 	}
 
@@ -43,14 +66,36 @@ func (e *Engine) assemble(gb *GraphBundle, tb *TTBundle, j transit.Journey, base
 	for _, l := range j.Legs {
 		if l.Ride {
 			leg := e.transitLeg(tt, l, base)
+			if len(legs) == firstRide && !initialRailReady.IsZero() && leg.Route != nil &&
+				transit.IsRailLikeRouteType(leg.Route.Type) {
+				leg.BoardReadyAt = initialRailReady
+			}
 			legs = append(legs, leg)
 			sig += fmt.Sprintf("t%d.", l.Trip)
 		} else {
 			leg := e.transferLeg(gb, tb, l.From, l.To)
-			prevArr := legs[len(legs)-1].Arrive
+			var prevArr time.Time
+			if len(legs) > 0 {
+				prevArr = legs[len(legs)-1].Arrive
+			} else if acc.mode == "none" {
+				// Onboard replans may begin with an in-station footpath from
+				// their source stop to the first outgoing platform.
+				readySec, ok := acc.sec[l.From]
+				if !ok {
+					return Itinerary{}, false
+				}
+				if acc.absolute {
+					prevArr = base.Add(time.Duration(readySec) * time.Second)
+				} else {
+					prevArr = base.Add(time.Duration(depSec+readySec) * time.Second)
+				}
+			} else {
+				return Itinerary{}, false
+			}
 			leg.Depart = prevArr
 			leg.Arrive = prevArr.Add(time.Duration(l.Sec) * time.Second)
 			leg.DurationS = int(l.Sec)
+			reconcileLegSteps(&leg)
 			legs = append(legs, leg)
 		}
 	}
@@ -67,6 +112,7 @@ func (e *Engine) assemble(gb *GraphBundle, tb *TTBundle, j transit.Journey, base
 	egressLeg.DurationS = int(egrSec)
 	egressLeg.From = stopPlace(tt, j.Target)
 	egressLeg.To = Place{Lat: e7f(tLat), Lon: e7f(tLon)}
+	reconcileLegSteps(&egressLeg)
 	legs = append(legs, egressLeg)
 
 	it := Itinerary{
@@ -177,58 +223,67 @@ func (e *Engine) stopStreetLeg(gb *GraphBundle, tb *TTBundle, modeTag string, pL
 	ns.Run(g, srcSeeds(g, sn, m, sf), m, sf, maxDs+1200)
 
 	// choose the cheaper stop anchor that was actually reached
-	anchor, extra := int32(-1), uint32(0)
+	anchor, totalDs := int32(-1), uint32(0)
 	if dU, okU := ns.Dist(ss.NodeU); okU {
-		anchor, extra = ss.NodeU, dU+uint32(ss.DsU)
+		anchor, totalDs = ss.NodeU, dU+fixedSpeedDs(uint32(ss.MetersU), sf)
 	}
 	if ss.NodeV >= 0 {
 		if dV, okV := ns.Dist(ss.NodeV); okV {
-			if anchor < 0 || dV+uint32(ss.DsV) < extra {
-				anchor, extra = ss.NodeV, dV+uint32(ss.DsV)
+			cand := dV + fixedSpeedDs(uint32(ss.MetersV), sf)
+			if anchor < 0 || cand < totalDs {
+				anchor, totalDs = ss.NodeV, cand
 			}
 		}
 	}
-	_ = extra
 	if anchor < 0 {
 		return straightLeg(leg, pLat, pLon, tt.StopLat[stop], tt.StopLon[stop], reverse)
 	}
 	edges := ns.PathTo(g, anchor)
+	pointAnchor := anchor
+	if len(edges) > 0 {
+		pointAnchor = g.SourceOf(edges[0])
+	}
 
 	if reverse {
 		if rev, ok := g.ReversePath(edges); ok {
 			edges = rev
 		} else {
-			edges = nil
+			return straightLeg(leg, pLat, pLon, tt.StopLat[stop], tt.StopLon[stop], true)
 		}
 	}
-	var lats, lons []int32
-	if len(edges) > 0 {
-		lats, lons = graph.PathGeometry(g, edges)
-		leg.Steps = stepsDTO(graph.Steps(g, edges, m, sf))
+
+	pointM := snapConnectorMeters(sn, pointAnchor)
+	stopM := stopConnectorMeters(ss, anchor)
+	startM, endM := pointM, stopM
+	startLat, startLon := pLat, pLon
+	endLat, endLon := tt.StopLat[stop], tt.StopLon[stop]
+	if reverse {
+		startM, endM = stopM, pointM
+		startLat, startLon, endLat, endLon = endLat, endLon, startLat, startLon
 	}
-	// stitch endpoints: point ↔ snapped entry, anchor ↔ stop
+	leg.Steps = routedSteps(graph.Steps(g, edges, m, sf), startM, endM,
+		fixedSpeedDs(uint32(startM), sf), fixedSpeedDs(uint32(endM), sf),
+		startLat, startLon, endLat, endLon)
+
+	// Stitch the off-network and partial-edge connectors onto the routed path.
 	stopLat, stopLon := tt.StopLat[stop], tt.StopLon[stop]
 	var enc geo.PolylineEncoder
-	dist := graph.PathMeters(g, edges)
 	if !reverse {
 		enc.Add(pLat, pLon)
-		enc.Add(sn.PLat, sn.PLon)
-		for i := range lats {
-			enc.Add(lats[i], lons[i])
-		}
+		appendSnapToNode(&enc, g, sn, pointAnchor)
+		appendPath(&enc, g, edges)
+		appendStopConnector(&enc, g, ss, anchor, stopLat, stopLon, false)
 		enc.Add(stopLat, stopLon)
 	} else {
 		enc.Add(stopLat, stopLon)
-		for i := range lats {
-			enc.Add(lats[i], lons[i])
-		}
-		enc.Add(sn.PLat, sn.PLon)
+		appendStopConnector(&enc, g, ss, anchor, stopLat, stopLon, true)
+		appendPath(&enc, g, edges)
+		appendNodeToSnap(&enc, g, sn, pointAnchor)
 		enc.Add(pLat, pLon)
 	}
-	dist += sn.PerpM + geo.Dist(pLat, pLon, sn.PLat, sn.PLon)*0 // perp already covers it
-	dist += float64(ss.PerpM)
 	leg.Polyline = enc.String()
-	leg.DistanceM = int(dist)
+	leg.DistanceM = int(graph.PathMeters(g, edges) + startM + endM)
+	leg.DurationS = int((totalDs + 5) / 10)
 	return leg
 }
 
@@ -253,23 +308,24 @@ func (e *Engine) transferLeg(gb *GraphBundle, tb *TTBundle, from, to int32) Leg 
 	}
 	ns := gb.Near()
 	defer gb.PutNear(ns)
-	seeds := []graph.Seed{{Node: sa.NodeU, Ds: uint32(sa.DsU)}}
+	seeds := []graph.Seed{{Node: sa.NodeU, Ds: fixedSpeedDs(uint32(sa.MetersU), sf)}}
 	if sa.NodeV >= 0 {
-		seeds = append(seeds, graph.Seed{Node: sa.NodeV, Ds: uint32(sa.DsV)})
+		seeds = append(seeds, graph.Seed{Node: sa.NodeV, Ds: fixedSpeedDs(uint32(sa.MetersV), sf)})
 	}
-	ns.Run(g, seeds, graph.ModeFoot, sf, uint32(e.Cfg.Routing.TransferRadiusM)*15)
+	ns.Run(g, seeds, graph.ModeFoot, sf,
+		fixedSpeedDs(uint32(e.Cfg.Routing.TransferRadiusM), sf))
 
 	anchor := int32(-1)
 	bestD := ^uint32(0)
 	for _, cand := range []struct {
-		n  int32
-		ds uint16
-	}{{sb.NodeU, sb.DsU}, {sb.NodeV, sb.DsV}} {
+		n int32
+		m uint16
+	}{{sb.NodeU, sb.MetersU}, {sb.NodeV, sb.MetersV}} {
 		if cand.n < 0 {
 			continue
 		}
-		if d, ok := ns.Dist(cand.n); ok && d+uint32(cand.ds) < bestD {
-			bestD = d + uint32(cand.ds)
+		if d, ok := ns.Dist(cand.n); ok && d+fixedSpeedDs(uint32(cand.m), sf) < bestD {
+			bestD = d + fixedSpeedDs(uint32(cand.m), sf)
 			anchor = cand.n
 		}
 	}
@@ -277,52 +333,207 @@ func (e *Engine) transferLeg(gb *GraphBundle, tb *TTBundle, from, to int32) Leg 
 		return straightLeg(leg, tt.StopLat[from], tt.StopLon[from], tt.StopLat[to], tt.StopLon[to], false)
 	}
 	edges := ns.PathTo(g, anchor)
+	fromAnchor := anchor
+	if len(edges) > 0 {
+		fromAnchor = g.SourceOf(edges[0])
+	}
+	fromM := stopConnectorMeters(sa, fromAnchor)
+	toM := stopConnectorMeters(sb, anchor)
 	var enc geo.PolylineEncoder
 	enc.Add(tt.StopLat[from], tt.StopLon[from])
-	if len(edges) > 0 {
-		lats, lons := graph.PathGeometry(g, edges)
-		for i := range lats {
-			enc.Add(lats[i], lons[i])
-		}
-		leg.Steps = stepsDTO(graph.Steps(g, edges, graph.ModeFoot, sf))
-	}
+	appendStopConnector(&enc, g, sa, fromAnchor, tt.StopLat[from], tt.StopLon[from], true)
+	appendPath(&enc, g, edges)
+	appendStopConnector(&enc, g, sb, anchor, tt.StopLat[to], tt.StopLon[to], false)
 	enc.Add(tt.StopLat[to], tt.StopLon[to])
 	leg.Polyline = enc.String()
-	leg.DistanceM = int(graph.PathMeters(g, edges) + float64(sa.PerpM) + float64(sb.PerpM))
+	leg.DistanceM = int(graph.PathMeters(g, edges) + fromM + toM)
+	leg.DurationS = int((bestD + 5) / 10)
+	leg.Steps = routedSteps(graph.Steps(g, edges, graph.ModeFoot, sf), fromM, toM,
+		fixedSpeedDs(uint32(fromM), sf), fixedSpeedDs(uint32(toM), sf),
+		tt.StopLat[from], tt.StopLon[from], tt.StopLat[to], tt.StopLon[to])
 	return leg
 }
 
 // roadLeg builds the single leg of a car/bike/walk direct route.
 func (e *Engine) roadLeg(g *graph.Graph, modeName string, m graph.Mode, sf uint32,
-	edges []uint32, snF, snT graph.Snap, fLat, fLon, tLat, tLon int32) Leg {
+	edges []uint32, endSeed int32, snF, snT graph.Snap, fLat, fLon, tLat, tLon int32) Leg {
 
 	leg := Leg{Mode: modeName,
 		From: Place{Lat: e7f(fLat), Lon: e7f(fLon)},
 		To:   Place{Lat: e7f(tLat), Lon: e7f(tLon)},
 	}
+	startNode := endSeed
+	if len(edges) > 0 {
+		startNode = g.SourceOf(edges[0])
+	}
+	startM := snapConnectorMeters(snF, startNode)
+	endM := snapConnectorMeters(snT, endSeed)
 	var enc geo.PolylineEncoder
 	enc.Add(fLat, fLon)
-	enc.Add(snF.PLat, snF.PLon)
-	if len(edges) > 0 {
-		lats, lons := graph.PathGeometry(g, edges)
-		for i := range lats {
-			enc.Add(lats[i], lons[i])
-		}
-		leg.Steps = stepsDTO(graph.Steps(g, edges, m, sf))
-	}
-	enc.Add(snT.PLat, snT.PLon)
+	appendSnapToNode(&enc, g, snF, startNode)
+	appendPath(&enc, g, edges)
+	appendNodeToSnap(&enc, g, snT, endSeed)
 	enc.Add(tLat, tLon)
 	leg.Polyline = enc.String()
-	leg.DistanceM = int(graph.PathMeters(g, edges) + snF.PerpM + snT.PerpM +
-		minF(snF.AlongU, snF.AlongV) + minF(snT.AlongU, snT.AlongV))
+	leg.DistanceM = int(graph.PathMeters(g, edges) + startM + endM)
+	leg.Steps = routedSteps(graph.Steps(g, edges, m, sf), startM, endM,
+		snapConnectorDs(g, snF, startNode, m, sf, true),
+		snapConnectorDs(g, snT, endSeed, m, sf, false),
+		fLat, fLon, tLat, tLon)
 	return leg
 }
 
-func minF(a, b float64) float64 {
-	if a < b {
-		return a
+func snapConnectorMeters(sn graph.Snap, node int32) float64 {
+	switch node {
+	case sn.U:
+		return sn.PerpM + sn.AlongU
+	case sn.V:
+		return sn.PerpM + sn.AlongV
 	}
-	return b
+	return sn.PerpM
+}
+
+func stopConnectorMeters(sn transit.StopSnap, node int32) float64 {
+	if node == sn.NodeU {
+		return float64(sn.MetersU)
+	}
+	if node == sn.NodeV {
+		return float64(sn.MetersV)
+	}
+	return 0
+}
+
+func snapConnectorDs(g *graph.Graph, sn graph.Snap, node int32, m graph.Mode, sf uint32, source bool) uint32 {
+	edge := int32(-1)
+	if source {
+		if node == sn.V && sn.Fwd >= 0 && g.Allowed(uint32(sn.Fwd), m) {
+			edge = sn.Fwd
+		} else if node == sn.U && sn.Bwd >= 0 && g.Allowed(uint32(sn.Bwd), m) {
+			edge = sn.Bwd
+		}
+	} else {
+		if node == sn.U && sn.Fwd >= 0 && g.Allowed(uint32(sn.Fwd), m) {
+			edge = sn.Fwd
+		} else if node == sn.V && sn.Bwd >= 0 && g.Allowed(uint32(sn.Bwd), m) {
+			edge = sn.Bwd
+		}
+	}
+	if edge < 0 {
+		edge = max32(sn.Fwd, 0)
+	}
+	return partialDs(g, uint32(edge), snapConnectorMeters(sn, node), m, sf)
+}
+
+func appendPath(enc *geo.PolylineEncoder, g *graph.Graph, edges []uint32) {
+	if len(edges) == 0 {
+		return
+	}
+	lats, lons := graph.PathGeometry(g, edges)
+	for i := range lats {
+		enc.Add(lats[i], lons[i])
+	}
+}
+
+// appendSnapToNode emits the partial snapped edge in travel order. Including
+// its intermediate geometry keeps the displayed line and the routed metres
+// in agreement even when the snapped street bends.
+func appendSnapToNode(enc *geo.PolylineEncoder, g *graph.Graph, sn graph.Snap, node int32) {
+	lats, lons, seg := snapGeometry(g, sn)
+	enc.Add(sn.PLat, sn.PLon)
+	if len(lats) == 0 {
+		if node >= 0 {
+			enc.Add(g.NodeLat[node], g.NodeLon[node])
+		}
+		return
+	}
+	if node == sn.U {
+		for i := seg; i >= 0; i-- {
+			enc.Add(lats[i], lons[i])
+		}
+		return
+	}
+	if node == sn.V {
+		for i := seg + 1; i < len(lats); i++ {
+			enc.Add(lats[i], lons[i])
+		}
+		return
+	}
+	enc.Add(g.NodeLat[node], g.NodeLon[node])
+}
+
+func appendNodeToSnap(enc *geo.PolylineEncoder, g *graph.Graph, sn graph.Snap, node int32) {
+	lats, lons, seg := snapGeometry(g, sn)
+	if len(lats) == 0 {
+		if node >= 0 {
+			enc.Add(g.NodeLat[node], g.NodeLon[node])
+		}
+		enc.Add(sn.PLat, sn.PLon)
+		return
+	}
+	if node == sn.U {
+		for i := 0; i <= seg; i++ {
+			enc.Add(lats[i], lons[i])
+		}
+	} else if node == sn.V {
+		for i := len(lats) - 1; i >= seg+1; i-- {
+			enc.Add(lats[i], lons[i])
+		}
+	} else {
+		enc.Add(g.NodeLat[node], g.NodeLon[node])
+	}
+	enc.Add(sn.PLat, sn.PLon)
+}
+
+func snapGeometry(g *graph.Graph, sn graph.Snap) (lats, lons []int32, segment int) {
+	if sn.Fwd < 0 {
+		return nil, nil, 0
+	}
+	lats, lons = g.AppendGeometry(uint32(sn.Fwd), sn.U, false, nil, nil)
+	segment = 0
+	remaining := sn.AlongU
+	for segment+1 < len(lats)-1 {
+		m := geo.Dist(lats[segment], lons[segment], lats[segment+1], lons[segment+1])
+		if remaining <= m {
+			break
+		}
+		remaining -= m
+		segment++
+	}
+	return lats, lons, segment
+}
+
+func appendStopConnector(enc *geo.PolylineEncoder, g *graph.Graph, sn transit.StopSnap,
+	node, stopLat, stopLon int32, stopToNode bool) {
+	streetSnap := graph.Snap{
+		Fwd: sn.Edge, U: sn.NodeU, V: sn.NodeV,
+		PLat: sn.SnapLat, PLon: sn.SnapLon, AlongU: float64(sn.AlongU),
+	}
+	if stopToNode {
+		enc.Add(stopLat, stopLon)
+		appendSnapToNode(enc, g, streetSnap, node)
+		return
+	}
+	appendNodeToSnap(enc, g, streetSnap, node)
+	enc.Add(stopLat, stopLon)
+}
+
+func routedSteps(in []graph.Step, startM, endM float64, startDs, endDs uint32,
+	startLat, startLon, endLat, endLon int32) []Step {
+	if len(in) == 0 {
+		return []Step{
+			{Kind: "depart", Modifier: "straight", DistanceM: int(startM + endM),
+				DurationS: int((startDs + endDs) / 10), Lat: e7f(startLat), Lon: e7f(startLon)},
+			{Kind: "arrive", Modifier: "straight", Lat: e7f(endLat), Lon: e7f(endLon)},
+		}
+	}
+	in[0].DistM += startM
+	in[0].Ds += startDs
+	in[0].Lat, in[0].Lon = startLat, startLon
+	lastMove := len(in) - 2 // graph.Steps always terminates with an arrive marker
+	in[lastMove].DistM += endM
+	in[lastMove].Ds += endDs
+	in[len(in)-1].Lat, in[len(in)-1].Lon = endLat, endLon
+	return stepsDTO(in)
 }
 
 func stepsDTO(in []graph.Step) []Step {
@@ -335,4 +546,58 @@ func stepsDTO(in []graph.Step) []Step {
 		}
 	}
 	return out
+}
+
+// reconcileLegSteps absorbs integer/decisecond rounding into the final
+// movement instruction so API consumers can trust both counters exactly.
+func reconcileLegSteps(leg *Leg) {
+	if leg.Mode == "transit" || leg.DistanceM == 0 && leg.DurationS == 0 {
+		return
+	}
+	if len(leg.Steps) == 0 {
+		leg.Steps = []Step{
+			{Kind: "depart", Modifier: "straight", DistanceM: leg.DistanceM,
+				DurationS: leg.DurationS, Lat: leg.From.Lat, Lon: leg.From.Lon},
+			{Kind: "arrive", Modifier: "straight", Lat: leg.To.Lat, Lon: leg.To.Lon},
+		}
+		return
+	}
+	leg.Steps[0].Lat, leg.Steps[0].Lon = leg.From.Lat, leg.From.Lon
+	last := len(leg.Steps) - 1
+	leg.Steps[last].Lat, leg.Steps[last].Lon = leg.To.Lat, leg.To.Lon
+	reconcileStepDistance(leg.Steps, leg.DistanceM)
+	reconcileStepDuration(leg.Steps, leg.DurationS)
+}
+
+func reconcileStepDistance(steps []Step, target int) {
+	sum := 0
+	for i := range steps {
+		sum += steps[i].DistanceM
+	}
+	adjustStepTotal(steps, target-sum, func(s *Step) *int { return &s.DistanceM })
+}
+
+func reconcileStepDuration(steps []Step, target int) {
+	sum := 0
+	for i := range steps {
+		sum += steps[i].DurationS
+	}
+	adjustStepTotal(steps, target-sum, func(s *Step) *int { return &s.DurationS })
+}
+
+func adjustStepTotal(steps []Step, delta int, field func(*Step) *int) {
+	lastMove := len(steps) - 1
+	if lastMove > 0 && steps[lastMove].Kind == "arrive" {
+		lastMove--
+	}
+	if delta >= 0 {
+		*field(&steps[lastMove]) += delta
+		return
+	}
+	for i := lastMove; i >= 0 && delta < 0; i-- {
+		v := field(&steps[i])
+		take := min(*v, -delta)
+		*v -= take
+		delta += take
+	}
 }

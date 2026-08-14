@@ -7,23 +7,28 @@ import (
 	"time"
 
 	"gotransit/internal/graph"
+	"gotransit/internal/transit"
 )
 
-// IsMetroType: metro/subway route types run frequently and reliably but
-// emit no VehiclePosition/TripUpdate entities — they count as live without
-// an RT signal (GTFS type 1 and extended urban-rail types 400-404).
-func IsMetroType(t int) bool { return t == 1 || (t >= 400 && t <= 404) }
+// IsRailLikeType reports routes eligible for schedule-assumed tracking when
+// no usable VehiclePosition is published.
+func IsRailLikeType(t int) bool { return transit.IsRailLikeRouteType(t) }
 
-// legLiveEligible: RT-confirmed, or a metro leg (always considered live).
+// IsMetroType is retained for source compatibility. The historical helper is
+// intentionally broadened to the full rail-like family.
+func IsMetroType(t int) bool { return IsRailLikeType(t) }
+
+// legLiveEligible: RT-confirmed, or rail-like (schedule-assumed when no
+// VehiclePosition exists; TripUpdates still adjust its times).
 func legLiveEligible(l *Leg) bool {
-	return l.Realtime || (l.Route != nil && IsMetroType(l.Route.Type))
+	return l.Realtime || (l.Route != nil && IsRailLikeType(l.Route.Type))
 }
 
 // annotateLive stamps each itinerary with the strict liveness rule:
-//   - the FIRST transit leg must be RT-covered (or metro) and depart within
+//   - the FIRST transit leg must be RT-covered (or rail-like) and depart within
 //     realtime.live_first_leg_within (the user's very first bus is certain);
 //   - every transit leg departing within realtime.live_horizon must be
-//     RT-covered (or metro); later legs may still be schedule-only.
+//     RT-covered (or rail-like); later legs may still be schedule-only.
 //
 // Itineraries without transit legs (pure bike) are deterministic → live.
 func (e *Engine) annotateLive(its []Itinerary, when time.Time) {
@@ -89,10 +94,20 @@ func (e *Engine) LookupItinerary(id string) (*CachedItinerary, bool) {
 	return c, true
 }
 
+// StopPlanSource describes how stop seeds were produced. ReadySlack is the
+// short allowance between the incoming vehicle's arrival and being ready to
+// board another vehicle. When PriorRail is true, RAPTOR measures a following
+// rail transfer from the unshifted arrival while bus boardings use only the
+// ready time.
+type StopPlanSource struct {
+	PriorRail  bool
+	ReadySlack time.Duration
+}
+
 // PlanFromStops runs a transit plan whose sources are stops with known
-// absolute arrival times — the "user is on board / at a stop" replan.
-// Itineraries start directly at a boarding stop (no access leg).
-func (e *Engine) PlanFromStops(seeds map[int32]time.Time, tLatF, tLonF float64, when time.Time, num int) ([]Itinerary, error) {
+// absolute vehicle-arrival times — the onboard replan. Itineraries start
+// directly at a boarding stop (no access leg).
+func (e *Engine) PlanFromStops(seeds map[int32]time.Time, tLatF, tLonF float64, when time.Time, num int, source StopPlanSource) ([]Itinerary, error) {
 	if !e.Ready() {
 		return nil, fmt.Errorf("engine not ready")
 	}
@@ -103,13 +118,31 @@ func (e *Engine) PlanFromStops(seeds map[int32]time.Time, tLatF, tLonF float64, 
 	local := when.In(tt.TZ)
 	base := time.Date(local.Year(), local.Month(), local.Day(), 0, 0, 0, 0, tt.TZ)
 
-	acc := accessSet{sec: map[int32]uint32{}, anchor: map[int32]int32{}, mode: "none"}
+	acc := accessSet{
+		sec: map[int32]uint32{}, anchor: map[int32]int32{}, mode: "none",
+		absolute: true,
+	}
+	if source.PriorRail {
+		acc.priorRailArr = map[int32]uint32{}
+	}
+	readySlack := source.ReadySlack
+	if readySlack < 0 {
+		readySlack = 0
+	}
 	for s, at := range seeds {
 		rel := at.Sub(base)
 		if rel < 0 {
 			continue
 		}
-		acc.sec[s] = uint32(rel.Seconds())
+		arrSec := uint32(rel.Seconds())
+		readySec := uint64(arrSec) + uint64(readySlack/time.Second)
+		if readySec >= uint64(^uint32(0)>>1) {
+			continue
+		}
+		acc.sec[s] = uint32(readySec)
+		if source.PriorRail {
+			acc.priorRailArr[s] = arrSec
+		}
 	}
 	if len(acc.sec) == 0 {
 		return nil, fmt.Errorf("no usable seeds")

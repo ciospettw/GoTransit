@@ -11,11 +11,12 @@ import (
 	"gotransit/internal/track"
 )
 
-// TestGPSFusion drives a session with client position fixes (protocol 2):
+// TestGPSFusion drives a session with client position fixes (protocol 3):
 //  1. walking with GPS → walk-progress events with live distance, and the
 //     street leg completes early when the rider reaches the boarding stop;
-//  2. sustained co-location with a vehicle confirmedly past the boarding
-//     stop → boarded, before any Passed/clock confirmation;
+//  2. after first reaching the stop, fresh fixes moving in order along the
+//     board→alight shape and >200 m away → boarded even with no vehicle
+//     position and no Passed confirmation;
 //  3. the rider does NOT get off at the alight stop and keeps following the
 //     line: >rode_past_dist from the stop with consecutive fixes inside the
 //     shape corridor beyond it → "stayed_on_vehicle" deviation + reroute
@@ -100,18 +101,51 @@ func TestGPSFusion(t *testing.T) {
 		return ev["type"] == "progress" && ev["status"] == "waiting"
 	})
 
-	// 2) boarding: the vehicle moves past the boarding stop (RT-confirmed) and
-	// the rider moves with it — riding starts, co-location corroborating
+	// 2) shape-only boarding fallback: the feed keeps reporting the trip but
+	// has neither VehiclePosition nor a passed stop. The rider has already
+	// reached SA; ordered fresh fixes now move away along A1's own shape. This
+	// must become riding rather than left_stop even though schedule/RT still
+	// make the engine believe the vehicle is waiting at SA.
 	tripNum := rideOf(t, it)[len("test:"):]
-	rolling := onTime("A1", "A2", "B1")
-	rolling.Vehicles = append(rolling.Vehicles, rt.VehicleRT{
-		TripID: tripNum, CurrentSeq: 2, Status: 2, // in_transit_to SM
-	})
-	srv.set(rolling)
-	target.Store(&[2]float64{saLat, saLon}) // still at SA while the bus leaves it
-	waitFor(t, sink, "boarding", 60*time.Second, func(ev map[string]any) bool {
-		return ev["type"] == "progress" && ev["status"] == "riding"
-	})
+	srv.set(onTime("A1", "A2", "B1"))
+	go func() {
+		// Pause for >left_stop's production hold around 178 m from SA: it is
+		// outside the wander radius but below the boarding threshold. Ordered
+		// shape evidence must keep the guard quiet until the final ~350 m fix.
+		for _, p := range []struct {
+			lonE7 int32
+			hold  time.Duration
+		}{
+			{oLon + 12000, 3 * time.Second},
+			{oLon + 22500, 12 * time.Second},
+			{oLon + 44000, 0},
+		} {
+			target.Store(&[2]float64{saLat, float64(p.lonE7) / 1e7})
+			if p.hold > 0 {
+				time.Sleep(p.hold)
+			}
+		}
+	}()
+	deadline := time.After(45 * time.Second)
+	for {
+		select {
+		case ev := <-sink:
+			t.Logf("event: %s %v", ev["type"], summarize(ev))
+			if ev["type"] == "warning" && ev["code"] == "left_stop" {
+				t.Fatalf("shape-coherent boarding triggered left_stop: %v", ev)
+			}
+			if ev["type"] == "reroute" && ev["reason"] == "left_stop" {
+				t.Fatalf("shape-coherent boarding rerouted from the stop: %v", ev)
+			}
+			if ev["type"] == "progress" && ev["status"] == "riding" {
+				goto boarded
+			}
+		case <-deadline:
+			t.Fatal("timed out waiting for shape-only boarding")
+		}
+	}
+
+boarded:
 
 	// 3) stayed on the line: the feed confirms SM passed (early run: negative
 	// delays put SA/SM in the past, vehicle heading to SB) while the rider's
@@ -143,6 +177,117 @@ func TestGPSFusion(t *testing.T) {
 	waitFor(t, sink, "recovery reroute", 30*time.Second, func(ev map[string]any) bool {
 		return ev["type"] == "reroute" && ev["reason"] == "stayed_on_vehicle"
 	})
+}
+
+// TestGPSRapidPickupBeforeWalkHandoff covers a bus arriving while the access
+// walk is still current. The rider stays at SA for less than atStopHold, then
+// follows A1's shape beyond the boarding threshold. Tracking must jump
+// directly walking -> riding: no synthetic waiting phase and no missed/reroute.
+func TestGPSRapidPickupBeforeWalkHandoff(t *testing.T) {
+	if testing.Short() {
+		t.Skip("wall-clock rapid-pickup E2E (~15s)")
+	}
+	w := buildWorld(t, worldOpts{midStopShape: true})
+	srv := newRTServer()
+	defer srv.Close()
+	mgr := newManager(t, w, srv)
+	w.e.Cfg.Routing.WalkSpeedKmh = 2.0
+
+	// No VehiclePosition and no Passed confirmation: only the rider's ordered
+	// shape evidence may promote the upcoming ride.
+	srv.set(onTime("A1", "A2", "B1"))
+	mgr.Start()
+	waitVersion(t, mgr, 1)
+
+	fromLat, fromLon, toLat, toLon := w.odMid()
+	resp, err := w.e.Plan(engine.Request{
+		FromLat: fromLat, FromLon: fromLon, ToLat: toLat, ToLon: toLon,
+		Mode: "transit", When: w.now, Live: true, Num: 3,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(resp.LiveItineraries) == 0 {
+		t.Fatal("expected live itineraries")
+	}
+	it := resp.LiveItineraries[0]
+	if len(it.Legs) < 2 || it.Legs[0].Mode == "transit" || it.Legs[1].Mode != "transit" {
+		t.Fatalf("fixture must start access-walk -> transit, got %+v", it.Legs)
+	}
+
+	tracker := &track.Tracker{E: w.e, Mgr: mgr, Cfg: w.e.Cfg, Log: testLogger(), Tick: 100 * time.Millisecond}
+	sink := make(chanSink, 128)
+	fixes := make(chan track.Fix, 8)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go tracker.Run(ctx, it.ID, sink, fixes)
+
+	waitFor(t, sink, "hello", 2*time.Second, func(ev map[string]any) bool {
+		return ev["type"] == "hello"
+	})
+
+	saLat, saLon := float64(oLat+1000)/1e7, float64(oLon+1000)/1e7
+	var target atomic.Pointer[[2]float64]
+	target.Store(&[2]float64{saLat, saLon})
+	go func() {
+		tk := time.NewTicker(300 * time.Millisecond)
+		defer tk.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-tk.C:
+				p := target.Load()
+				select {
+				case fixes <- track.Fix{Lat: p[0], Lon: p[1], AccuracyM: 10, HeadingD: -1, SpeedMS: -1, At: time.Now()}:
+				default:
+				}
+			}
+		}
+	}()
+
+	// One second is safely below atStopHold (10s), but enough for gpsStopGuard
+	// to latch that the rider really reached this ride's boarding stop.
+	time.Sleep(time.Second)
+	go func() {
+		for _, p := range []struct {
+			lonE7 int32
+			hold  time.Duration
+		}{
+			{oLon + 12000, 3 * time.Second},
+			{oLon + 30000, 4 * time.Second}, // >200m from SA, ordered and persisted
+		} {
+			target.Store(&[2]float64{saLat, float64(p.lonE7) / 1e7})
+			time.Sleep(p.hold)
+		}
+	}()
+
+	deadline := time.After(20 * time.Second)
+	for {
+		select {
+		case ev := <-sink:
+			t.Logf("event: %s %v", ev["type"], summarize(ev))
+			if ev["type"] == "progress" && ev["status"] == "waiting" {
+				t.Fatalf("rapid pickup emitted an intermediate waiting phase: %v", ev)
+			}
+			if ev["type"] == "warning" {
+				if code := ev["code"]; code == "too_slow" || code == "left_stop" || code == "missed_connection" {
+					t.Fatalf("rapid pickup emitted %v before boarding: %v", code, ev)
+				}
+			}
+			if ev["type"] == "reroute" {
+				t.Fatalf("rapid pickup rerouted instead of boarding: %v", ev)
+			}
+			if ev["type"] == "progress" && ev["status"] == "riding" {
+				if ev["leg_index"] != float64(1) || ev["boarded"] != true {
+					t.Fatalf("invalid direct riding transition: %v", ev)
+				}
+				return
+			}
+		case <-deadline:
+			t.Fatal("timed out waiting for direct walking-to-riding promotion")
+		}
+	}
 }
 
 // TestGPSStopGuard: the rider is too far from the boarding stop to make the
@@ -209,5 +354,79 @@ func TestGPSStopGuard(t *testing.T) {
 	})
 	waitFor(t, sink, "too_slow reroute", 60*time.Second, func(ev map[string]any) bool {
 		return ev["type"] == "reroute" && ev["reason"] == "too_slow"
+	})
+}
+
+// TestGPSShapeMismatchKeepsLeftStopGuard is the conservative half of the
+// shape-only boarding fallback. Reaching the stop is latched, but fixes that
+// then move away perpendicular to the ride shape are not boarding evidence:
+// the ordinary persisted left_stop guard must remain armed.
+func TestGPSShapeMismatchKeepsLeftStopGuard(t *testing.T) {
+	if testing.Short() {
+		t.Skip("wall-clock GPS guard E2E (~25s)")
+	}
+	w := buildWorld(t, worldOpts{midStopShape: true})
+	srv := newRTServer()
+	defer srv.Close()
+	mgr := newManager(t, w, srv)
+
+	// Make walk-back unambiguously infeasible as soon as the rider is outside
+	// the wander radius; persistence is still the production 10-second hold.
+	w.e.Cfg.Track.BoardBuffer = 10 * time.Minute
+	w.e.Cfg.Routing.WalkSpeedKmh = 2.0
+	srv.set(onTime("A1", "A2", "B1"))
+	mgr.Start()
+	waitVersion(t, mgr, 1)
+
+	fromLat, fromLon, toLat, toLon := w.odMid()
+	resp, err := w.e.Plan(engine.Request{
+		FromLat: fromLat, FromLon: fromLon, ToLat: toLat, ToLon: toLon,
+		Mode: "transit", When: w.now, Live: true, Num: 3,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(resp.LiveItineraries) == 0 {
+		t.Fatal("expected live itineraries")
+	}
+
+	tracker := &track.Tracker{E: w.e, Mgr: mgr, Cfg: w.e.Cfg, Log: testLogger(), Tick: 100 * time.Millisecond}
+	sink := make(chanSink, 128)
+	fixes := make(chan track.Fix, 8)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go tracker.Run(ctx, resp.LiveItineraries[0].ID, sink, fixes)
+
+	waitFor(t, sink, "hello", 2*time.Second, func(ev map[string]any) bool {
+		return ev["type"] == "hello"
+	})
+
+	saLat, saLon := float64(oLat+1000)/1e7, float64(oLon+1000)/1e7
+	var target atomic.Pointer[[2]float64]
+	target.Store(&[2]float64{saLat, saLon})
+	go func() {
+		tk := time.NewTicker(400 * time.Millisecond)
+		defer tk.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-tk.C:
+				p := target.Load()
+				select {
+				case fixes <- track.Fix{Lat: p[0], Lon: p[1], AccuracyM: 10, HeadingD: -1, SpeedMS: -1, At: time.Now()}:
+				default:
+				}
+			}
+		}
+	}()
+
+	waitFor(t, sink, "waiting after reaching stop", 25*time.Second, func(ev map[string]any) bool {
+		return ev["type"] == "progress" && ev["status"] == "waiting"
+	})
+	// About 545 m north of SA, while A1's shape runs east-west.
+	target.Store(&[2]float64{float64(oLat+50000) / 1e7, saLon})
+	waitFor(t, sink, "left_stop for shape-incoherent fixes", 30*time.Second, func(ev map[string]any) bool {
+		return ev["type"] == "warning" && ev["code"] == "left_stop"
 	})
 }

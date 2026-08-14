@@ -53,12 +53,17 @@ func TestOverlaySemantics(t *testing.T) {
 	}
 
 	// cancellation + skipped stop + vehicle in a mixed feed
+	vehicleStamp := uint64(time.Now().Add(-7 * time.Minute).Unix())
 	srv.set(&rt.Feed{
+		Timestamp: uint64(time.Now().Unix()),
 		Trips: []rt.TripRT{
 			{TripID: "B1", Cancelled: true},
 			{TripID: "A2", STUs: []rt.STU{{Seq: 2, StopID: "SB", ArrDelay: rt.Absent, DepDelay: rt.Absent, Skipped: true}}},
 		},
-		Vehicles: []rt.VehicleRT{{TripID: "A2", Lat: 41.905, Lon: 12.507, CurrentSeq: 2, Status: 2}},
+		Vehicles: []rt.VehicleRT{{
+			TripID: "A2", Lat: 41.905, Lon: 12.507, CurrentSeq: 2, Status: 2,
+			Timestamp: vehicleStamp,
+		}},
 	})
 	waitVersion(t, mgr, 3)
 	o = w.tt.RT()
@@ -76,6 +81,9 @@ func TestOverlaySemantics(t *testing.T) {
 	}
 	if o.TripPassed(a2) != 0 {
 		t.Errorf("vehicle in transit to pos1 → passed=0, got %d", o.TripPassed(a2))
+	}
+	if got := o.VehicleTime(a2); got != vehicleStamp {
+		t.Errorf("vehicle timestamp = %d, want entity timestamp %d", got, vehicleStamp)
 	}
 
 	// stats surface matched/cancelled counts

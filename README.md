@@ -71,24 +71,24 @@ COTRAL and Trenitalia examples ship in `gotransit init`) and:
 - every plan is **RT-adjusted by construction** — RAPTOR reads times through
   an immutable realtime overlay (per-stop delay propagation, cancellations,
   skipped stops, vehicle positions), swapped atomically on every poll;
-- `&live=1` returns **live itineraries**: the first bus is *certain*
-  (RT-confirmed, departing ≤45 min) and everything in the next hour is
-  covered. **Metro counts as live by definition** — frequent, always running,
-  it just doesn't emit VP/TU entities;
+- `&live=1` returns **live itineraries**: the first road vehicle is
+  RT-confirmed and departs ≤45 min out, while rail-like services remain
+  trackable from their timetable and any available TripUpdates even when the
+  operator publishes no VehiclePosition;
 - `GET /v1/track?itinerary=<id>` upgrades to a **WebSocket** (RFC 6455,
-  hand-rolled, of course) and the engine walks with the user — **no GPS
-  needed**. It trusts the feeds: if GTFS-RT says your bus passed your stop,
-  you're on board.
+  hand-rolled, of course). GPS is optional: with it, the tracker latches a
+  reached boarding stop and can confirm an early pickup from ordered movement
+  along the ride shape; without it, the clock and realtime feeds govern.
 
 Sequential, client-friendly events:
 
 | event | what you get |
 |---|---|
-| `hello` | the tracked itinerary, `live` or `monitor` mode |
+| `hello` | the tracked itinerary, `live` or `monitor` mode (`protocol: 3`) |
 | `vehicle` | 🚌 where your bus **is** — position, the stop it's approaching, `stops_away` from you, its delay — even while you're still walking |
 | `delay` | refreshed per-leg times whenever anything moves ≥30 s |
-| `progress` | boarding confirmed / alighted |
-| `warning` | `no_rt_signal`, `possibly_cancelled` (inferred *before* the operator's late CANCELED shows up) |
+| `progress` | boarding confirmed / alighted; rail fallback adds `tracking_source: "schedule_assumed"` |
+| `warning` | `no_rt_signal`, `possibly_cancelled`, or one-shot `position_unavailable` before schedule-assumed rail tracking |
 | `reroute` | a full replacement itinerary + `changed_legs` + reason: `better_arrival` (≥5 min gained, never flip-flops), `cancelled`, `missed_connection` (yes, also the bus that came *early*), `stop_skipped` |
 | `arrived` | 🎉 |
 
