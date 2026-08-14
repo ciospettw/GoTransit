@@ -42,6 +42,11 @@ type world struct {
 // worldOpts tweaks the fixture.
 type worldOpts struct {
 	metroInsteadOfA bool // line A becomes a metro (route type 1)
+	// midStopShape: line A gets a third stop SM midway between SA and SB and
+	// a proper shape along the row — needed by the "stayed on the line"
+	// (rode-past) detector, which follows the pattern shape beyond the
+	// alight stop.
+	midStopShape bool
 }
 
 func buildWorld(t *testing.T, opts worldOpts) *world {
@@ -59,6 +64,9 @@ func buildWorld(t *testing.T, opts worldOpts) *world {
 		f.Stops = append(f.Stops, gtfs.Stop{ID: id, Name: "Stop " + id, Lat: lat, Lon: lon, OK: true})
 	}
 	addStop("SA", oLat+1000, oLon+1000)
+	if opts.midStopShape {
+		addStop("SM", oLat+1000, oLon+3*step/2)
+	}
 	addStop("SB", oLat+1000, oLon+3*step-1000)
 
 	typeA := 3
@@ -72,9 +80,34 @@ func buildWorld(t *testing.T, opts worldOpts) *world {
 	f.ShapeIdx = map[string]int32{}
 	f.Headsigns = []string{""}
 
+	shapeA := int32(-1)
+	if opts.midStopShape {
+		// shape along the stops' row, SA → SB, densely sampled
+		sh := gtfs.Shape{ID: "shpA"}
+		for k := 0; k <= 12; k++ {
+			sh.Lat = append(sh.Lat, oLat+1000)
+			sh.Lon = append(sh.Lon, oLon+1000+int32(k)*(3*step-2000)/12)
+		}
+		f.ShapeIdx["shpA"] = int32(len(f.Shapes))
+		shapeA = int32(len(f.Shapes))
+		f.Shapes = append(f.Shapes, sh)
+	}
+
 	addTrip := func(id string, route int32, dep, arr uint32) {
-		f.Trips = append(f.Trips, gtfs.Trip{RouteIdx: route, ServiceIdx: 0, ShapeIdx: -1, ID: id})
+		shp := int32(-1)
+		if route == 0 {
+			shp = shapeA
+		}
+		f.Trips = append(f.Trips, gtfs.Trip{RouteIdx: route, ServiceIdx: 0, ShapeIdx: shp, ID: id})
 		f.TripSTOff = append(f.TripSTOff, uint32(len(f.STArr)))
+		if opts.midStopShape && route == 0 {
+			mid := (dep + arr) / 2
+			f.STArr = append(f.STArr, dep, mid, arr)
+			f.STDep = append(f.STDep, dep, mid, arr)
+			f.STStop = append(f.STStop, f.StopIdx["SA"], f.StopIdx["SM"], f.StopIdx["SB"])
+			f.STSeq = append(f.STSeq, 1, 2, 3)
+			return
+		}
 		f.STArr = append(f.STArr, dep, arr)
 		f.STDep = append(f.STDep, dep, arr)
 		f.STStop = append(f.STStop, f.StopIdx["SA"], f.StopIdx["SB"])
@@ -102,6 +135,12 @@ func buildWorld(t *testing.T, opts worldOpts) *world {
 func (w *world) od() (fromLat, fromLon, toLat, toLon float64) {
 	return float64(oLat+2000) / 1e7, float64(oLon+2000) / 1e7,
 		float64(oLat+2000) / 1e7, float64(oLon+3*step-2000) / 1e7
+}
+
+// odMid returns from near SA and to near the midway stop SM (midStopShape).
+func (w *world) odMid() (fromLat, fromLon, toLat, toLon float64) {
+	return float64(oLat+2000) / 1e7, float64(oLon+2000) / 1e7,
+		float64(oLat+2000) / 1e7, float64(oLon+3*step/2+1000) / 1e7
 }
 
 // ---- mutable GTFS-RT server -----------------------------------------------------

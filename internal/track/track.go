@@ -33,8 +33,13 @@ type Tracker struct {
 
 // Events (type field first so clients can switch on it).
 type evHello struct {
-	Type      string           `json:"type"` // "hello"
-	Mode      string           `json:"mode"` // "live" | "monitor"
+	Type string `json:"type"` // "hello"
+	Mode string `json:"mode"` // "live" | "monitor"
+	// Protocol 2: dual GPS/virtual tracking — the server derives ALL
+	// stop-related states from streamed positions (or runs pure virtual
+	// when none arrive) and may emit risk / connection_risk / too_slow /
+	// left_stop / stayed_on_vehicle events.
+	Protocol  int              `json:"protocol"`
 	Itinerary engine.Itinerary `json:"itinerary"`
 }
 type evDelay struct {
@@ -129,7 +134,8 @@ type session struct {
 	lastTry   time.Time // infeasibility replan attempt throttle
 	warned    map[string]bool
 	arrivedAt time.Time
-	gps       gpsState // client position evidence (optional)
+	gps       gpsState          // client position evidence (optional)
+	risk      map[int]*riskState // live connection-risk hysteresis, per leg
 }
 
 // Run drives one tracking session until arrival, error or ctx cancellation.
@@ -151,7 +157,7 @@ func (t *Tracker) Run(ctx context.Context, itID string, sink Sink, fixes <-chan 
 	if s.liveMode {
 		mode = "live"
 	}
-	sink.Send(evHello{"hello", mode, s.it})
+	sink.Send(evHello{"hello", mode, 2, s.it})
 	if done, err := s.evaluate(time.Now()); err == nil && done {
 		sink.Send(evArrived{"arrived", s.arrivedAt})
 		return nil
@@ -216,6 +222,18 @@ func (s *session) evaluate(now time.Time) (bool, error) {
 	s.emitVehicle(tt, o)
 	s.emitWalkProgress(tt, now)
 
+	// GPS silence after fixes were flowing: tell the client once and keep
+	// governing with the virtual rider (protocol falls back to virtual).
+	if s.gps.has && now.Sub(s.gps.cur.At) > s.t.Cfg.Track.GPSStaleAfter {
+		if !s.warned["gps_lost"] {
+			s.warned["gps_lost"] = true
+			s.sink.Send(evWarning{"warning", "gps_lost", s.legIdx,
+				"no recent position fixes; tracking continues on schedule and realtime data only"})
+		}
+	} else if s.gps.fresh(now) {
+		s.warned["gps_lost"] = false
+	}
+
 	// GPS-confirmed deviations outrank plan feasibility: the rider already
 	// IS somewhere else, the plan must follow them
 	if dev := s.gpsDeviation(tt, o, now); dev != nil {
@@ -223,9 +241,21 @@ func (s *session) evaluate(now time.Time) (bool, error) {
 		return false, s.reroute(tt, o, now, dev.ev.Kind, dev.ev.Message, 0)
 	}
 
+	// proactive stop guard: too slow to reach the boarding stop / walked
+	// away beyond recovery → reroute BEFORE the bus is actually missed
+	if act := s.gpsStopGuard(tt, now); act != nil {
+		return false, s.reroute(tt, o, now, act.reason, act.message, 0)
+	}
+
 	if !feas.ok {
 		s.t.Log.Debug("infeasible", "reason", feas.reason, "legIdx", s.legIdx, "boarded", s.boarded)
 		return false, s.reroute(tt, o, now, feas.reason, feas.message, 0)
+	}
+
+	// probabilistic look-ahead: score every remaining connection with the
+	// freshly RT-adjusted times and act BEFORE a tight one is actually lost
+	if s.evaluateRisk(tt, o, now, times) {
+		return false, nil
 	}
 
 	// schedule-only guard + cancellation blindness on the next boarding
@@ -327,11 +357,18 @@ func (s *session) advance(tt *transit.Timetable, o *transit.RTOverlay, now time.
 				return // still waiting at the stop
 			}
 		}
-		if passed >= int16(r.alight) || now.After(arrRT.Add(90*time.Second)) {
+		// GPS alight assist: the rider is measurably AT the alight stop while
+		// the vehicle is confirmedly there or beyond → they got off, even if
+		// the feed's Passed has not caught up yet.
+		gpsAlighted := s.gps.fresh(now) &&
+			s.vehicleBeyond(tt, o, r, int(r.alight)-1) &&
+			hold(&s.gps.nearStopSince,
+				s.gps.distTo(leg.To.Lat, leg.To.Lon) <= s.gps.radius(nearStopBase), now, atStopHold)
+		if passed >= int16(r.alight) || now.After(arrRT.Add(90*time.Second)) || gpsAlighted {
 			// GPS veto: the feed says the vehicle cleared the stop, but the
-			// rider is still measurably ON it → hold; gpsDeviation decides
-			// (missed_alight) once the evidence is conclusive
-			if s.gpsWithVehicle(tt, o, r, now, 0) {
+			// rider is still measurably ON it → hold; the rode-past check
+			// (gps.go) decides once the evidence is conclusive
+			if !gpsAlighted && s.gpsWithVehicle(tt, o, r, now, 0) {
 				return
 			}
 			s.legIdx++
@@ -640,6 +677,7 @@ func (s *session) switchTo(it engine.Itinerary, reason, msg string, saving int) 
 	s.lastEmit = map[int]legTime{}
 	s.lastVeh = evVehicle{}
 	s.warned = map[string]bool{} // fresh plan, fresh guard state
+	s.risk = map[int]*riskState{}
 	s.gps.resetLegAnchors()
 	s.gps.deviated = map[string]bool{} // fresh plan, fresh deviation slate
 	s.liveMode = it.Live || s.liveMode
@@ -718,7 +756,9 @@ func (s *session) replan(tt *transit.Timetable, o *transit.RTOverlay, now time.T
 		}
 		its, err := s.t.E.PlanFromStops(seeds, dLat, dLon, now, 3)
 		if err != nil || len(its) == 0 {
-			return engine.Itinerary{}, false
+			// no ride works from the downstream stops (e.g. end of the line,
+			// destination already behind): walking from here may still
+			return s.walkFallback(now, dLat, dLon)
 		}
 		return pickBest(its, s.liveMode), true
 	}
@@ -735,9 +775,31 @@ func (s *session) replan(tt *transit.Timetable, o *transit.RTOverlay, now time.T
 	req.Num = 3
 	resp, err := s.t.E.Plan(req)
 	if err != nil || len(resp.Itineraries) == 0 {
-		return engine.Itinerary{}, false
+		// No transit journey from here — typically the destination is now
+		// within walking distance (any ride would arrive later than just
+		// walking, so RAPTOR prunes everything). The engine never strands
+		// the rider: hand them a plain walk when it is a reasonable one.
+		return s.walkFallback(now, dLat, dLon)
 	}
 	return pickBest(resp.Itineraries, s.liveMode), true
+}
+
+// walkFallback offers a plain walking itinerary from the rider's position
+// when no transit replan exists. Capped at 30 minutes: beyond that, keeping
+// the search alive beats sending someone on an absurd hike.
+func (s *session) walkFallback(now time.Time, dLat, dLon float64) (engine.Itinerary, bool) {
+	lat, lon := s.replanPoint(now)
+	req := s.req
+	req.FromLat, req.FromLon = lat, lon
+	req.ToLat, req.ToLon = dLat, dLon
+	req.Mode = "walk"
+	req.When = now
+	req.ArriveBy = false
+	if resp, err := s.t.E.Plan(req); err == nil && len(resp.Itineraries) > 0 &&
+		resp.Itineraries[0].DurationS <= 30*60 {
+		return resp.Itineraries[0], true
+	}
+	return engine.Itinerary{}, false
 }
 
 // pickBest chooses the reroute target with three rules, in order:
@@ -775,13 +837,16 @@ func pickBest(its []engine.Itinerary, wantLive bool) engine.Itinerary {
 	for i := 1; i < len(its); i++ {
 		a, b := &its[best], &its[i]
 		ca, cb := class(a), class(b)
+		// expected arrivals (risk-adjusted): a nominally-faster plan built on
+		// a fragile connection must not win the reroute
+		ea, eb := a.ExpectedArrive(), b.ExpectedArrive()
 		switch {
 		case cb < ca:
 			best = i
 		case cb > ca:
-		case b.Arrive.Before(a.Arrive.Add(-60 * time.Second)):
+		case eb.Before(ea.Add(-60 * time.Second)):
 			best = i
-		case a.Arrive.Before(b.Arrive.Add(-60 * time.Second)):
+		case ea.Before(eb.Add(-60 * time.Second)):
 		case walk(b) < walk(a):
 			best = i
 		}

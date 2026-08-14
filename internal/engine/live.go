@@ -122,6 +122,7 @@ func (e *Engine) PlanFromStops(seeds map[int32]time.Time, tLatF, tLonF float64, 
 	}
 	req := Request{ToLat: tLatF, ToLon: tLonF, Mode: "transit", When: when, Num: num}
 	its := e.runRaptor(gb, tb, req, when, 0, 0, tLat, tLon, &acc, &egr)
+	e.annotateRisk(its)
 	its = dedupeRank(its, num)
 	e.annotateLive(its, when)
 	e.remember(its, req)

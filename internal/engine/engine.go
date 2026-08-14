@@ -11,6 +11,7 @@ import (
 
 	"gotransit/internal/config"
 	"gotransit/internal/graph"
+	"gotransit/internal/stats"
 	"gotransit/internal/transit"
 )
 
@@ -51,6 +52,10 @@ func (b *TTBundle) PutRaptor(r *transit.Raptor) { b.rap.Put(r) }
 // Engine is the live routing engine.
 type Engine struct {
 	Cfg *config.Config
+
+	// Stats supplies learned delay distributions to the probability model
+	// (risk.go). Nil-safe: without it the analytic fallback still runs.
+	Stats stats.Provider
 
 	gb atomic.Pointer[GraphBundle]
 	tb atomic.Pointer[TTBundle]

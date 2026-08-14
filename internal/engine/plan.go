@@ -39,7 +39,15 @@ type Itinerary struct {
 	Transfers int       `json:"transfers"`
 	Legs      []Leg     `json:"legs"`
 
-	sig string // dedupe signature
+	// Feasibility is the product of the per-leg catch probabilities (risk.go):
+	// the chance the whole chain of connections works out. RiskLevel is the
+	// worst per-leg level ("ok" | "warn" | "risk"). Informational only —
+	// risky itineraries are ranked down, never hidden.
+	Feasibility float64 `json:"feasibility,omitempty"`
+	RiskLevel   string  `json:"risk_level,omitempty"`
+
+	sig    string    // dedupe signature
+	expArr time.Time // expected arrival incl. miss costs; zero = use Arrive
 }
 
 type Place struct {
@@ -96,6 +104,12 @@ type Leg struct {
 	Steps     []Step     `json:"steps,omitempty"`
 	Realtime  bool       `json:"realtime,omitempty"` // trip has live GTFS-RT data
 	DelayS    int        `json:"delay_s,omitempty"`  // departure delay vs schedule
+
+	// Transit legs only: probability the rider makes THIS boarding given the
+	// connection slack and the delay distributions (risk.go). RiskLevel is
+	// the discretized label ("ok" ≥ risk_ok, "warn" ≥ risk_warn, else "risk").
+	CatchProb float64 `json:"catch_prob,omitempty"`
+	RiskLevel string  `json:"risk_level,omitempty"`
 }
 
 // Plan answers a routing request against the current snapshots.
@@ -332,6 +346,7 @@ func (e *Engine) planTransit(req Request, fLat, fLon, tLat, tLon int32, bikeAllo
 	if len(all) == 0 {
 		return nil, fmt.Errorf("no transit itinerary found")
 	}
+	e.annotateRisk(all)
 	all = dedupeRank(all, req.Num)
 	e.annotateLive(all, when)
 	e.remember(all, req)
@@ -496,13 +511,27 @@ func dateInt(t time.Time) uint32 {
 	return uint32(t.Year()*10000 + int(t.Month())*100 + t.Day())
 }
 
-// dedupeRank sorts by arrival then trims duplicates and caps the count.
+// dedupeRank sorts by EXPECTED arrival (nominal arrival + Σ (1−P)·missCost
+// over the connections, stamped by annotateRisk; zero expArr = plain arrival),
+// then trims duplicates and caps the count. A fast itinerary with fragile
+// connections loses to a robust one arriving slightly later — but it stays
+// in the list, labeled, for the rider to choose.
 func dedupeRank(its []Itinerary, num int) []Itinerary {
-	sort.Slice(its, func(i, j int) bool {
-		if !its[i].Arrive.Equal(its[j].Arrive) {
-			return its[i].Arrive.Before(its[j].Arrive)
+	eff := func(it *Itinerary) time.Time {
+		if it.expArr.IsZero() {
+			return it.Arrive
 		}
-		return its[i].Transfers < its[j].Transfers
+		return it.expArr
+	}
+	sort.Slice(its, func(i, j int) bool {
+		ei, ej := eff(&its[i]), eff(&its[j])
+		if !ei.Equal(ej) {
+			return ei.Before(ej)
+		}
+		if its[i].Transfers != its[j].Transfers {
+			return its[i].Transfers < its[j].Transfers
+		}
+		return its[i].Arrive.Before(its[j].Arrive)
 	})
 	seen := map[string]bool{}
 	out := its[:0]

@@ -80,6 +80,47 @@ type Config struct {
 		// trace is treated as possibly cancelled (CANCELED often shows up
 		// only ~2 min after scheduled departure)
 		CancelBlind time.Duration
+
+		// live connection-risk monitoring (track/risk.go): warn below
+		// RiskWarnLive, reroute proactively below RiskRerouteThreshold —
+		// both sustained for RiskConfirmEvals evaluations and, for the
+		// reroute, at least RiskMinBreach after the first breach.
+		RiskWarnLive         float64
+		RiskRerouteThreshold float64
+		RiskConfirmEvals     int
+		RiskMinBreach        time.Duration
+	}
+
+	// Track: GPS-protocol tolerances for /v1/track sessions (internal/track).
+	Track struct {
+		// StopWanderRadius: within this distance of the boarding stop the
+		// rider counts as waiting, whatever the GPS says (jitter, bar…).
+		StopWanderRadius float64 // meters
+		// BoardBuffer is the safety margin required on top of the walk ETA
+		// when deciding "you can no longer make it".
+		BoardBuffer time.Duration
+		// RodePastDistM + RodePastFixes: the "stayed on the line" detector —
+		// this far from the expected alight stop with this many consecutive
+		// fixes following the line's shape beyond it.
+		RodePastDistM float64
+		RodePastFixes int
+		// GPSStaleAfter: no fix for this long → warn the client (gps_lost)
+		// and let the virtual rider govern alone.
+		GPSStaleAfter time.Duration
+	}
+
+	// Stats: opt-in accumulation of per-route delay distributions from
+	// GTFS-RT (internal/stats). RECOMMENDED but optional: when disabled the
+	// engine computes probabilities analytically (headway-based σ) and
+	// collects nothing. Deployments with an external data pipeline keep
+	// this off and may inject their own stats.Provider.
+	Stats struct {
+		Enabled          bool
+		Dir              string // snapshot dir; empty = Cache.Dir, else in-memory only
+		SnapshotInterval time.Duration
+		HalfLife         time.Duration // decay half-life of observations
+		MinSamples       int           // trust threshold per histogram bucket
+		SampleStride     int           // record every Nth passed stop (1 = all)
 	}
 
 	Routing struct {
@@ -103,6 +144,19 @@ type Config struct {
 		CarHeuristic string // "fast" (weighted A*, ~few % from optimal) or "exact"
 
 		MaxItineraries int
+
+		// Probabilistic ranking (engine/risk.go): itineraries are ordered by
+		// EXPECTED arrival — nominal arrival plus (1−P)·missCost for every
+		// connection — instead of raw arrival. Never hides itineraries.
+		RiskRanking bool
+		// MissCostDefault is the assumed wait after a missed connection when
+		// the line's headway is unknown.
+		MissCostDefault time.Duration
+		// WalkSigmaFrac scales walking-time uncertainty: σw = frac·walkSec.
+		WalkSigmaFrac float64
+		// RiskOk / RiskWarn discretize probabilities into badge levels.
+		RiskOk   float64
+		RiskWarn float64
 	}
 }
 
@@ -129,6 +183,25 @@ func Default() *Config {
 	c.Realtime.LiveFirstLeg = 45 * time.Minute
 	c.Realtime.LiveHorizon = time.Hour
 	c.Realtime.CancelBlind = 3 * time.Minute
+	c.Realtime.RiskWarnLive = 0.60
+	c.Realtime.RiskRerouteThreshold = 0.35
+	c.Realtime.RiskConfirmEvals = 2
+	c.Realtime.RiskMinBreach = 30 * time.Second
+	c.Routing.RiskRanking = true
+	c.Routing.MissCostDefault = 15 * time.Minute
+	c.Routing.WalkSigmaFrac = 0.2
+	c.Routing.RiskOk = 0.90
+	c.Routing.RiskWarn = 0.70
+	c.Stats.Enabled = false
+	c.Stats.SnapshotInterval = 10 * time.Minute
+	c.Stats.HalfLife = 14 * 24 * time.Hour
+	c.Stats.MinSamples = 20
+	c.Stats.SampleStride = 1
+	c.Track.StopWanderRadius = 150
+	c.Track.BoardBuffer = time.Minute
+	c.Track.RodePastDistM = 1000
+	c.Track.RodePastFixes = 3
+	c.Track.GPSStaleAfter = time.Minute
 	return c
 }
 
@@ -216,6 +289,35 @@ func parse(data []byte) (*Config, error) {
 	if c.Realtime.CancelBlind, err = rt.Dur("cancel_blind", c.Realtime.CancelBlind); err != nil {
 		return nil, err
 	}
+	c.Realtime.RiskWarnLive = rt.Float("risk_warn_live", c.Realtime.RiskWarnLive)
+	c.Realtime.RiskRerouteThreshold = rt.Float("risk_reroute_threshold", c.Realtime.RiskRerouteThreshold)
+	c.Realtime.RiskConfirmEvals = int(rt.Int("risk_confirm_evals", int64(c.Realtime.RiskConfirmEvals)))
+	if c.Realtime.RiskMinBreach, err = rt.Dur("risk_min_breach", c.Realtime.RiskMinBreach); err != nil {
+		return nil, err
+	}
+
+	tk := t.Table("track")
+	c.Track.StopWanderRadius = tk.Float("stop_wander_radius", c.Track.StopWanderRadius)
+	if c.Track.BoardBuffer, err = tk.Dur("board_buffer", c.Track.BoardBuffer); err != nil {
+		return nil, err
+	}
+	c.Track.RodePastDistM = tk.Float("rode_past_dist_m", c.Track.RodePastDistM)
+	c.Track.RodePastFixes = int(tk.Int("rode_past_fixes", int64(c.Track.RodePastFixes)))
+	if c.Track.GPSStaleAfter, err = tk.Dur("gps_stale_after", c.Track.GPSStaleAfter); err != nil {
+		return nil, err
+	}
+
+	st := t.Table("stats")
+	c.Stats.Enabled = st.Bool("enabled", c.Stats.Enabled)
+	c.Stats.Dir = st.Str("dir", "")
+	if c.Stats.SnapshotInterval, err = st.Dur("snapshot_interval", c.Stats.SnapshotInterval); err != nil {
+		return nil, err
+	}
+	if c.Stats.HalfLife, err = st.Dur("half_life", c.Stats.HalfLife); err != nil {
+		return nil, err
+	}
+	c.Stats.MinSamples = int(st.Int("min_samples", int64(c.Stats.MinSamples)))
+	c.Stats.SampleStride = int(st.Int("sample_stride", int64(c.Stats.SampleStride)))
 
 	r := t.Table("routing")
 	c.Routing.WalkSpeedKmh = r.Float("walk_speed_kmh", c.Routing.WalkSpeedKmh)
@@ -238,6 +340,13 @@ func parse(data []byte) (*Config, error) {
 	c.Routing.BikeCostFactor = r.Float("bike_cost_factor", c.Routing.BikeCostFactor)
 	c.Routing.CarHeuristic = r.Str("car_heuristic", c.Routing.CarHeuristic)
 	c.Routing.MaxItineraries = int(r.Int("max_itineraries", int64(c.Routing.MaxItineraries)))
+	c.Routing.RiskRanking = r.Bool("risk_ranking", c.Routing.RiskRanking)
+	if c.Routing.MissCostDefault, err = r.Dur("miss_cost_default", c.Routing.MissCostDefault); err != nil {
+		return nil, err
+	}
+	c.Routing.WalkSigmaFrac = r.Float("walk_sigma_frac", c.Routing.WalkSigmaFrac)
+	c.Routing.RiskOk = r.Float("risk_ok", c.Routing.RiskOk)
+	c.Routing.RiskWarn = r.Float("risk_warn", c.Routing.RiskWarn)
 
 	return c, validate(c)
 }

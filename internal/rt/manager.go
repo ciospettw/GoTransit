@@ -24,12 +24,22 @@ type Source struct {
 	Headers          map[string]string // attached to every fetch (private upstreams)
 }
 
+// OverlayObserver is notified after every overlay rebuild with the previous
+// and the freshly built overlay: the tap where delay statistics are sampled
+// (see internal/stats). Optional; must be fast and must not retain overlays.
+type OverlayObserver interface {
+	ObserveOverlay(tt *transit.Timetable, prev, next *transit.RTOverlay)
+}
+
 // Manager polls every source, projects the union onto the current timetable
 // as an immutable RTOverlay, and broadcasts a version bump to whoever tracks.
 type Manager struct {
 	Log     *slog.Logger
 	Sources []Source
 	TT      func() *transit.Timetable // current snapshot getter
+
+	// Observer, when set, samples each prev→next overlay transition.
+	Observer OverlayObserver
 
 	mu      sync.Mutex
 	tu      map[int]*Feed // last decoded trip updates per source
@@ -210,6 +220,10 @@ func (m *Manager) Rebuild() {
 	ver := m.version.Load() + 1
 	o := buildOverlay(tt, m.Sources, tu, vp, m.stats, time.Now(), ver)
 	m.mu.Unlock()
+
+	if m.Observer != nil {
+		m.Observer.ObserveOverlay(tt, tt.RT(), o)
+	}
 
 	tt.SetRT(o)
 	m.version.Store(ver)

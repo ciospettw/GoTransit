@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"runtime/debug"
 	"sync/atomic"
 	"time"
@@ -18,6 +19,7 @@ import (
 	"gotransit/internal/engine"
 	"gotransit/internal/graph"
 	"gotransit/internal/rt"
+	"gotransit/internal/stats"
 	"gotransit/internal/track"
 	"gotransit/internal/transit"
 	"gotransit/internal/updater"
@@ -231,6 +233,33 @@ func (r *Runtime) Run() {
 			Poll: f.RTPoll, Insecure: f.AllowInsecure, Headers: f.Headers,
 		})
 	}
+	// ---- delay statistics (opt-in; the analytic model runs regardless) ----
+	var collector *stats.Collector
+	if cfg.Stats.Enabled {
+		store := stats.NewStore(cfg.Stats.HalfLife, float64(cfg.Stats.MinSamples))
+		snapDir := cfg.Stats.Dir
+		if snapDir == "" {
+			snapDir = cfg.Cache.Dir
+		}
+		snapPath := ""
+		if snapDir != "" {
+			snapPath = filepath.Join(snapDir, "delaystats.gob")
+			if err := store.Load(snapPath); err != nil {
+				log.Warn("delay stats snapshot load failed (starting empty)", "err", err)
+			} else {
+				log.Info("delay stats loaded", "buckets", store.Len(), "path", snapPath)
+			}
+			go store.Run(context.Background(), snapPath, cfg.Stats.SnapshotInterval, func(err error) {
+				log.Warn("delay stats snapshot failed", "err", err)
+			})
+		} else {
+			log.Info("delay stats enabled in-memory only (no [cache]/[stats] dir configured)")
+		}
+		collector = stats.NewCollector(store)
+		collector.SampleStride = cfg.Stats.SampleStride
+		e.Stats = store
+	}
+
 	if len(sources) > 0 {
 		mgr := rt.NewManager(log, sources, func() *transit.Timetable {
 			if tb := e.TTBundle(); tb != nil {
@@ -238,6 +267,9 @@ func (r *Runtime) Run() {
 			}
 			return nil
 		})
+		if collector != nil {
+			mgr.Observer = collector
+		}
 		e.RTStats = func() any { return mgr.Stats() }
 		up.OnSwap = func() { // re-project RT onto every fresh timetable
 			mgr.Rebuild()

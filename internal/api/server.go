@@ -90,16 +90,25 @@ func (s *Server) handleTrack(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			var m struct {
-				Type      string  `json:"type"`
-				Lat       float64 `json:"lat"`
-				Lon       float64 `json:"lon"`
-				AccuracyM float64 `json:"accuracy_m"`
-				TS        string  `json:"ts"` // RFC3339, optional
+				Type      string   `json:"type"`
+				Lat       float64  `json:"lat"`
+				Lon       float64  `json:"lon"`
+				AccuracyM float64  `json:"accuracy_m"`
+				Heading   *float64 `json:"heading"` // course over ground, optional
+				Speed     *float64 `json:"speed"`   // m/s, optional
+				TS        string   `json:"ts"`      // RFC3339, optional
 			}
 			if json.Unmarshal(msg, &m) != nil || m.Type != "position" {
 				continue
 			}
-			f := track.Fix{Lat: m.Lat, Lon: m.Lon, AccuracyM: m.AccuracyM, At: time.Now()}
+			f := track.Fix{Lat: m.Lat, Lon: m.Lon, AccuracyM: m.AccuracyM,
+				HeadingD: -1, SpeedMS: -1, At: time.Now()}
+			if m.Heading != nil {
+				f.HeadingD = *m.Heading
+			}
+			if m.Speed != nil {
+				f.SpeedMS = *m.Speed
+			}
 			if m.TS != "" {
 				if t, err := time.Parse(time.RFC3339, m.TS); err == nil {
 					f.At = t
