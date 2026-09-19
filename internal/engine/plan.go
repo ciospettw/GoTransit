@@ -104,6 +104,7 @@ type Leg struct {
 	Steps     []Step     `json:"steps,omitempty"`
 	Realtime  bool       `json:"realtime,omitempty"` // trip has live GTFS-RT data
 	DelayS    int        `json:"delay_s,omitempty"`  // departure delay vs schedule
+	Boarded   bool       `json:"boarded,omitempty"`  // retained onboard leg in a live replan
 	// BoardReadyAt is internal tracking metadata. It is populated when an
 	// onboard replan starts directly at a rail transfer, whose incoming-arrival
 	// anchor would otherwise be absent from the returned itinerary.
@@ -357,7 +358,7 @@ func (e *Engine) planTransit(req Request, fLat, fLon, tLat, tLon int32, bikeAllo
 	if len(all) == 0 {
 		return nil, fmt.Errorf("no transit itinerary found")
 	}
-	e.annotateRisk(all)
+	e.annotateRisk(all, when)
 	all = dedupeRank(all, req.Num)
 	e.annotateLive(all, when)
 	e.remember(all, req)

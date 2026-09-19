@@ -129,8 +129,9 @@ type session struct {
 	it       engine.Itinerary
 	origArr  time.Time // first promise, for arrive_delta_s
 	liveMode bool
-	legIdx   int  // first uncompleted leg
-	boarded  bool // for the current transit leg
+	legIdx   int           // first uncompleted leg
+	boarded  bool          // for the current transit leg
+	atStop   *engine.Place // GPS-confirmed stop; unaffected by subsequent jitter
 	// boardedByShape keeps stale vehicle data from triggering opportunistic
 	// replans until the feed catches up with the inferred boarding.
 	boardedByShape bool
@@ -165,6 +166,9 @@ func (t *Tracker) Run(ctx context.Context, itID string, sink Sink, fixes <-chan 
 		gps: newGPSState(),
 	}
 	s.resetRailReady()
+	if len(s.it.Legs) > 0 {
+		s.boarded = s.it.Legs[0].Boarded
+	}
 	mode := "monitor"
 	if s.liveMode {
 		mode = "live"
@@ -222,6 +226,7 @@ func (s *session) evaluate(now time.Time) (bool, error) {
 	tt := tb.TT
 	o := tt.RT()
 
+	s.arriveAtBoardingStop(tt, o, now)
 	s.ensureCurrentRailReady(tt, now)
 	s.advance(tt, o, now)
 	if s.legIdx >= len(s.it.Legs) {
@@ -269,6 +274,9 @@ func (s *session) evaluate(now time.Time) (bool, error) {
 	}
 
 	if !feas.ok {
+		if s.shapeBoardingInProgress(tt, now) && feas.reason == "missed_connection" {
+			return false, nil
+		}
 		s.t.Log.Debug("infeasible", "reason", feas.reason, "legIdx", s.legIdx, "boarded", s.boarded)
 		return false, s.reroute(tt, o, now, feas.reason, feas.message, 0)
 	}
@@ -285,7 +293,7 @@ func (s *session) evaluate(now time.Time) (bool, error) {
 			s.warned[warn.Code+fmt.Sprint(warn.LegIndex)] = true
 			s.sink.Send(*warn)
 		}
-		if s.liveMode {
+		if s.liveMode && now.Sub(s.lastRR) >= betterArrivalCooldown && !s.shapeBoardingInProgress(tt, now) {
 			// try to move the user onto RT-confirmed legs
 			if err := s.reroute(tt, o, now, "unconfirmed_trip",
 				"next trip has no realtime signal; rerouting onto confirmed service", 10*time.Minute); err == nil {
@@ -374,8 +382,7 @@ func (s *session) advance(tt *transit.Timetable, o *transit.RTOverlay, now time.
 			// (arriving early at a stop only ever helps)
 			atEnd := false
 			if !s.opaqueAt(tt, o, now, s.legIdx) && s.gps.fresh(now) {
-				near := s.gps.distTo(leg.To.Lat, leg.To.Lon) <= s.gps.radius(nearStopBase)
-				atEnd = hold(&s.gps.nearStopSince, near, now, atStopHold)
+				atEnd = s.gps.distTo(leg.To.Lat, leg.To.Lon) <= nearStopBase
 			}
 			if now.After(leg.Arrive) || atEnd {
 				completedAt := leg.Arrive
@@ -473,6 +480,7 @@ func (s *session) advance(tt *transit.Timetable, o *transit.RTOverlay, now time.
 				(s.vehicleBeyond(tt, o, r, int(r.board)) && s.gpsWithVehicle(tt, o, r, now, confirmOn)) {
 				s.boarded = true
 				s.boardedByShape = shapeBoarded
+				s.atStop = nil
 				s.gps.resetLegAnchors()
 				s.sendProgress("riding", s.legIdx, true, "")
 			} else {
@@ -485,8 +493,18 @@ func (s *session) advance(tt *transit.Timetable, o *transit.RTOverlay, now time.
 		gpsAlighted := s.gps.fresh(now) &&
 			s.vehicleBeyond(tt, o, r, int(r.alight)-1) &&
 			hold(&s.gps.nearStopSince,
-				s.gps.distTo(leg.To.Lat, leg.To.Lon) <= s.gps.radius(nearStopBase), now, atStopHold)
+				s.gps.distTo(leg.To.Lat, leg.To.Lon) <= nearStopBase, now, atStopHold)
 		if passed >= int16(r.alight) || now.After(arrRT.Add(90*time.Second)) || gpsAlighted {
+			// A stale ETA cannot put a GPS-observed rider on foot while they
+			// are still following this ride far from its alighting stop.
+			if !gpsAlighted && s.gps.fresh(now) && s.gps.distTo(leg.To.Lat, leg.To.Lon) > nearStopBase {
+				if passed < int16(r.alight) {
+					return // an overdue prediction alone is not evidence of alighting
+				}
+				if seg, ok := shapeBetween(tt, r); ok && seg.within(tt, s.gps.cur.Lat, s.gps.cur.Lon, s.gps.radius(offVehBase)) {
+					return
+				}
+			}
 			// GPS veto: the feed says the vehicle cleared the stop, but the
 			// rider is still measurably ON it → hold; the rode-past check
 			// (gps.go) decides once the evidence is conclusive
@@ -524,6 +542,7 @@ func (s *session) boardNextRideFromAccessShape(tt *transit.Timetable, o *transit
 	s.legIdx = next
 	s.boarded = true
 	s.boardedByShape = true
+	s.atStop = nil
 	s.gps.resetLegAnchors()
 	s.sendProgress("riding", next, true, "")
 	return true
@@ -562,6 +581,7 @@ func (s *session) completeAlight(tt *transit.Timetable, o *transit.RTOverlay, no
 	s.legIdx++
 	s.boarded = false
 	s.boardedByShape = false
+	s.atStop = nil
 	s.gps.resetLegAnchors()
 	s.sendProgress("alighted", completed, false, source)
 	// The handoff is explicit so clients never hang on the alight phase.
@@ -1078,6 +1098,9 @@ func (s *session) reroute(tt *transit.Timetable, o *transit.RTOverlay, now time.
 		return nil // keep retrying on subsequent cycles
 	}
 	if tolerance > 0 {
+		if sameRides(s.it.Legs[s.legIdx:], best.Legs) {
+			return nil // do not repeatedly announce the same unconfirmed option
+		}
 		if cur, ok := s.currentArrival(); ok && best.Arrive.After(cur.Add(tolerance)) {
 			return nil // alternative too costly for a soft reroute
 		}
@@ -1092,12 +1115,22 @@ func (s *session) reroute(tt *transit.Timetable, o *transit.RTOverlay, now time.
 }
 
 func (s *session) switchTo(it engine.Itinerary, reason, msg string, saving int) {
+	if len(it.Legs) == 0 {
+		return
+	}
+	wasBoarded, byShape := s.boarded, s.boardedByShape
+	if wasBoarded && (!it.Legs[0].Boarded || it.Legs[0].TripID != s.it.Legs[s.legIdx].TripID) {
+		return // every replacement path must preserve the occupied vehicle
+	}
 	s.t.Log.Debug("switchTo", "reason", reason, "legs", len(it.Legs), "arrive", it.Arrive, "id", it.ID)
 	changed := changedLegs(s.it.Legs[min(s.legIdx, len(s.it.Legs)):], it.Legs)
 	s.it = it
 	s.legIdx = 0
-	s.boarded = false
-	s.boardedByShape = false
+	s.boarded = it.Legs[0].Boarded
+	s.boardedByShape = s.boarded && byShape
+	if s.boarded || it.Legs[0].Mode != "transit" || s.reachedPlace() == nil {
+		s.atStop = nil
+	}
 	s.lastEmit = map[int]legTime{}
 	s.lastVeh = evVehicle{}
 	s.warned = map[string]bool{} // fresh plan, fresh guard state
@@ -1109,6 +1142,25 @@ func (s *session) switchTo(it engine.Itinerary, reason, msg string, saving int) 
 	s.liveMode = it.Live || s.liveMode
 	s.sink.Send(evReroute{Type: "reroute", Reason: reason, SavingS: saving, Message: msg,
 		ChangedLegs: changed, Itinerary: it})
+	if s.boarded {
+		s.sendProgress("riding", 0, true, "")
+	} else if s.reachedPlace() != nil {
+		s.gps.latchReachedStop(s.boardingKey(0))
+		s.sendProgress("waiting", 0, false, "")
+	}
+}
+
+func sameRides(a, b []engine.Leg) bool {
+	keys := func(legs []engine.Leg) string {
+		key := ""
+		for i := range legs {
+			if legs[i].Mode == "transit" {
+				key += legSignature(&legs[i]) + ";"
+			}
+		}
+		return key
+	}
+	return keys(a) == keys(b)
 }
 
 // legSignature identifies a leg across plans: same ride (trip + board/alight)
@@ -1166,10 +1218,7 @@ func (s *session) replan(tt *transit.Timetable, o *transit.RTOverlay, now time.T
 		base := rideBase(tt, r, leg.Depart)
 		seeds := map[int32]time.Time{}
 		stops := tt.PatternStops(tt.PatternOfTrip(r.trip))
-		from := int(r.board) + 1
-		if p := o.TripPassed(r.trip); int(p)+1 > from {
-			from = int(p) + 1
-		}
+		from := s.firstAlightPosition(tt, o, r, now)
 		for pos := from; pos < int(tt.TripLen(r.trip)); pos++ {
 			if tt.StopSkipped(r.trip, uint16(pos)) {
 				continue
@@ -1182,15 +1231,26 @@ func (s *session) replan(tt *transit.Timetable, o *transit.RTOverlay, now time.T
 		}
 		source := engine.StopPlanSource{
 			PriorRail:  railLikeLeg(tt, leg),
-			ReadySlack: 15 * time.Second,
+			ReadySlack: s.t.Cfg.Routing.TransferSlack,
+			Onboard:    leg,
 		}
-		its, err := s.t.E.PlanFromStops(seeds, dLat, dLon, now, 3, source)
+		its, err := s.t.E.PlanFromStops(seeds, dLat, dLon, now, 12, source)
 		if err != nil || len(its) == 0 {
-			// no ride works from the downstream stops (e.g. end of the line,
-			// destination already behind): walking from here may still
-			return s.walkFallback(now, dLat, dLon)
+			return engine.Itinerary{}, false // keep riding while searching
 		}
-		return pickBest(its, s.liveMode), true
+		return s.pickFeasible(its, now)
+	}
+	if stop := s.reachedPlace(); stop != nil {
+		for id, stopID := range tt.StopID {
+			if stopID != stop.StopID {
+				continue
+			}
+			its, err := s.t.E.PlanFromStops(map[int32]time.Time{int32(id): now}, dLat, dLon, now, 12, engine.StopPlanSource{})
+			if err == nil {
+				return s.pickFeasible(its, now)
+			}
+		}
+		return engine.Itinerary{}, false
 	}
 
 	// walking or waiting: replan from the rider's real position when the
@@ -1202,7 +1262,7 @@ func (s *session) replan(tt *transit.Timetable, o *transit.RTOverlay, now time.T
 	req.Mode = "transit"
 	req.When = now
 	req.ArriveBy = false
-	req.Num = 3
+	req.Num = 12
 	resp, err := s.t.E.Plan(req)
 	if err != nil || len(resp.Itineraries) == 0 {
 		// No transit journey from here — typically the destination is now
@@ -1211,13 +1271,80 @@ func (s *session) replan(tt *transit.Timetable, o *transit.RTOverlay, now time.T
 		// the rider: hand them a plain walk when it is a reasonable one.
 		return s.walkFallback(now, dLat, dLon)
 	}
-	return pickBest(resp.Itineraries, s.liveMode), true
+	return s.pickFeasible(resp.Itineraries, now)
+}
+
+// Give a rider two stops of notice. GPS shape progress can be ahead of stale
+// TripUpdates, so those updates must never seed a stop already behind them.
+func (s *session) firstAlightPosition(tt *transit.Timetable, o *transit.RTOverlay, r ride, now time.Time) int {
+	passed := max(int(r.board), int(o.TripPassed(r.trip)))
+	positionKnown := o.TripPassed(r.trip) >= 0
+	if _, _, pos, status, ok := o.Vehicle(r.trip); ok && pos >= 0 {
+		at := int(pos) - 1
+		if status == 1 { // dwelling at this stop: two subsequent stops of notice
+			at = int(pos)
+		}
+		passed = max(passed, at)
+		positionKnown = true
+	}
+	if s.gps.fresh(now) {
+		full := r
+		full.alight = tt.TripLen(r.trip) - 1
+		if seg, ok := shapeBetween(tt, full); ok {
+			along, distance, ok := seg.project(tt, s.gps.cur.Lat, s.gps.cur.Lon)
+			if ok && distance <= s.gps.radius(offVehBase) {
+				positionKnown = true
+				pat := tt.PatternOfTrip(r.trip)
+				for pos := int(r.board) + 1; pos <= int(full.alight); pos++ {
+					idx := tt.PatShapeIdx[tt.PatFirstStop[pat]+uint32(pos)]
+					stopAlong := float64(tt.ShpCumDm[idx]-tt.ShpCumDm[seg.lo]) / 10
+					if along >= stopAlong {
+						passed = max(passed, pos)
+					}
+				}
+			}
+		}
+	}
+	if !positionKnown {
+		base := rideBase(tt, r, s.it.Legs[s.legIdx].Depart)
+		for pos := int(r.board) + 1; pos < int(tt.TripLen(r.trip)); pos++ {
+			if !base.Add(time.Duration(tt.TripDep(r.trip, uint16(pos))) * time.Second).After(now) {
+				passed = pos
+			}
+		}
+	}
+	return passed + 2
+}
+
+func (s *session) pickFeasible(its []engine.Itinerary, now time.Time) (engine.Itinerary, bool) {
+	valid := make([]engine.Itinerary, 0, len(its))
+	for _, it := range its {
+		it.Legs = append([]engine.Leg(nil), it.Legs...) // cached plans remain immutable
+		s.t.E.AssessRisk(&it, now)
+		ok := len(it.Legs) > 0
+		for _, leg := range it.Legs {
+			if leg.Mode == "transit" && !leg.Boarded && leg.CatchProb < 0.8 {
+				ok = false
+				break
+			}
+		}
+		if ok {
+			valid = append(valid, it)
+		}
+	}
+	if len(valid) == 0 {
+		return engine.Itinerary{}, false
+	}
+	return pickBest(valid, s.liveMode), true
 }
 
 // walkFallback offers a plain walking itinerary from the rider's position
 // when no transit replan exists. Capped at 30 minutes: beyond that, keeping
 // the search alive beats sending someone on an absurd hike.
 func (s *session) walkFallback(now time.Time, dLat, dLon float64) (engine.Itinerary, bool) {
+	if s.boarded {
+		return engine.Itinerary{}, false
+	}
 	lat, lon := s.replanPoint(now)
 	req := s.req
 	req.FromLat, req.FromLon = lat, lon
@@ -1287,6 +1414,9 @@ func pickBest(its []engine.Itinerary, wantLive bool) engine.Itinerary {
 // replanPoint is where replans start from: the real GPS fix when fresh,
 // otherwise the plan-based estimate.
 func (s *session) replanPoint(now time.Time) (float64, float64) {
+	if stop := s.reachedPlace(); stop != nil {
+		return stop.Lat, stop.Lon
+	}
 	if s.gps.fresh(now) {
 		return s.gps.cur.Lat, s.gps.cur.Lon
 	}

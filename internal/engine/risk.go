@@ -17,13 +17,14 @@ import (
 	"math"
 	"time"
 
+	"gotransit/internal/geo"
 	"gotransit/internal/stats"
 	"gotransit/internal/transit"
 )
 
 // riskSigma: analytic σ (seconds) for a leg's residual delay when no learned
 // distribution is available. RT-covered trips are largely predictable.
-const rtResidualSigma = 75
+const rtResidualSigma = 25
 
 // ExpectedArrive is the risk-adjusted arrival (nominal + expected miss cost)
 // used for ranking; falls back to the nominal arrival when risk annotation
@@ -38,7 +39,7 @@ func (it *Itinerary) ExpectedArrive() time.Time {
 }
 
 // annotateRisk stamps probabilities on every itinerary (no-op when disabled).
-func (e *Engine) annotateRisk(its []Itinerary) {
+func (e *Engine) annotateRisk(its []Itinerary, now time.Time) {
 	if e.Cfg == nil || !e.Cfg.Routing.RiskRanking {
 		return
 	}
@@ -47,11 +48,11 @@ func (e *Engine) annotateRisk(its []Itinerary) {
 		return
 	}
 	for i := range its {
-		e.riskOne(&its[i], tb.TT)
+		e.riskOne(&its[i], tb.TT, now)
 	}
 }
 
-func (e *Engine) riskOne(it *Itinerary, tt *transit.Timetable) {
+func (e *Engine) riskOne(it *Itinerary, tt *transit.Timetable, now time.Time) {
 	r := e.Cfg.Routing
 	product := 1.0
 	expShift := 0.0 // expected extra seconds from potentially missed connections
@@ -59,7 +60,7 @@ func (e *Engine) riskOne(it *Itinerary, tt *transit.Timetable) {
 
 	var prevTransit *Leg
 	walkSec := 0.0 // street time since the previous transit leg (or the start)
-	prevArrive := it.Depart
+	prevArrive := now
 
 	for li := range it.Legs {
 		l := &it.Legs[li]
@@ -69,40 +70,11 @@ func (e *Engine) riskOne(it *Itinerary, tt *transit.Timetable) {
 			continue
 		}
 
-		slack := l.Depart.Sub(prevArrive).Seconds()
-		conn := stats.Conn{
-			SlackSec:      slack,
-			WalkSec:       walkSec,
-			WalkSigmaFrac: r.WalkSigmaFrac,
-		}
-
-		local := l.Depart.In(tt.TZ)
-		day := stats.DayTypeOf(local)
 		headway := e.headwaySec(tt, l)
-
-		// Incoming side: the previous bus's arrival delay (first boarding of
-		// the chain has no incoming vehicle — only the walk uncertainty).
-		if prevTransit != nil {
-			prevLocal := prevTransit.Arrive.In(tt.TZ)
-			if h, ok := e.dist(stats.Arrival, prevTransit, stats.DayTypeOf(prevLocal), prevLocal.Hour()); ok {
-				conn.ArrDist = h
-			} else if prevTransit.Realtime {
-				conn.ArrSigma = rtResidualSigma
-			} else {
-				conn.ArrSigma = stats.HeadwaySigma(e.headwaySec(tt, prevTransit))
-			}
+		p := e.ConnectionProbability(tt, l, prevTransit, prevArrive, walkSec, now)
+		if l.Boarded {
+			p = 1 // its arrival uncertainty still contributes to the next change
 		}
-
-		// Outgoing side: this bus's departure delay (a late bus HELPS).
-		if h, ok := e.dist(stats.Departure, l, day, local.Hour()); ok {
-			conn.DepDist = h
-		} else if l.Realtime {
-			conn.DepSigma = rtResidualSigma
-		} else {
-			conn.DepSigma = stats.HeadwaySigma(headway)
-		}
-
-		p := stats.Catch(conn)
 		l.CatchProb = math.Round(p*1000) / 1000
 		l.RiskLevel = riskLabel(p, r.RiskOk, r.RiskWarn)
 		worst = worstRisk(worst, l.RiskLevel)
@@ -128,6 +100,73 @@ func (e *Engine) riskOne(it *Itinerary, tt *transit.Timetable) {
 	it.Feasibility = math.Round(product*1000) / 1000
 	it.RiskLevel = worst
 	it.expArr = it.Arrive.Add(time.Duration(expShift * float64(time.Second)))
+}
+
+// AssessRisk is also used to validate live replacements when ordinary search
+// risk ranking is disabled. A reroute must still be physically catchable.
+func (e *Engine) AssessRisk(it *Itinerary, now time.Time) {
+	if tb := e.TTBundle(); tb != nil {
+		e.riskOne(it, tb.TT, now)
+	}
+}
+
+// ConnectionProbability is shared by planning and live evaluation, so a
+// replacement cannot pass one model and immediately fail the other.
+func (e *Engine) ConnectionProbability(tt *transit.Timetable, outgoing, incoming *Leg, ready time.Time, walkSec float64, now time.Time) float64 {
+	if incoming == nil && walkSec == 0 && !outgoing.Depart.Before(now) {
+		return 1 // already at this stop: there is no access walk left to miss
+	}
+	margin := e.Cfg.Track.BoardBuffer.Seconds()
+	if incoming != nil {
+		margin = e.Cfg.Routing.TransferSlack.Seconds()
+	}
+	c := stats.Conn{SlackSec: outgoing.Depart.Sub(ready).Seconds() - margin,
+		WalkSec: walkSec, WalkSigmaFrac: e.Cfg.Routing.WalkSigmaFrac}
+	fill := func(leg *Leg, kind stats.Kind) (*stats.Hist, float64, float64) {
+		at := leg.Depart
+		if kind == stats.Arrival {
+			at = leg.Arrive
+		}
+		local := at.In(tt.TZ)
+		forecast := predictionUncertainty(tt, leg, kind == stats.Arrival, now)
+		if h, ok := e.dist(kind, leg, stats.DayTypeOf(local), local.Hour()); ok {
+			return h, 0, forecast
+		}
+		if leg.Realtime {
+			return nil, rtResidualSigma, forecast
+		}
+		return nil, stats.HeadwaySigma(e.headwaySec(tt, leg)), forecast
+	}
+	var a, d float64
+	if incoming != nil {
+		c.ArrDist, c.ArrSigma, a = fill(incoming, stats.Arrival)
+	}
+	c.DepDist, c.DepSigma, d = fill(outgoing, stats.Departure)
+	c.ForecastSigma = math.Hypot(a, d)
+	return stats.Catch(c)
+}
+
+func predictionUncertainty(tt *transit.Timetable, leg *Leg, arrival bool, now time.Time) float64 {
+	target, at := leg.From, leg.Depart
+	if arrival {
+		target, at = leg.To, leg.Arrive
+	}
+	distance := 0.0
+	if trip, ok := tt.TripIdx[leg.TripID]; ok {
+		lat, lon, pos, _, has := tt.RT().Vehicle(trip)
+		if has {
+			if lat == 0 && lon == 0 {
+				stops := tt.PatternStops(tt.PatternOfTrip(trip))
+				if pos >= 0 && int(pos) < len(stops) {
+					lat, lon = tt.StopLat[stops[pos]], tt.StopLon[stops[pos]]
+				}
+			}
+			if lat != 0 || lon != 0 {
+				distance = geo.Dist(lat, lon, int32(target.Lat*1e7), int32(target.Lon*1e7))
+			}
+		}
+	}
+	return stats.ForecastSigma(at.Sub(now).Seconds(), distance)
 }
 
 // dist queries the learned distribution for a leg's route, centering it when

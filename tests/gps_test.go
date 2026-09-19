@@ -15,7 +15,7 @@ import (
 //  1. walking with GPS → walk-progress events with live distance, and the
 //     street leg completes early when the rider reaches the boarding stop;
 //  2. after first reaching the stop, fresh fixes moving in order along the
-//     board→alight shape and >200 m away → boarded even with no vehicle
+//     board→alight shape and >100 m away → boarded even with no vehicle
 //     position and no Passed confirmation;
 //  3. the rider does NOT get off at the alight stop and keeps following the
 //     line: >rode_past_dist from the stop with consecutive fixes inside the
@@ -88,17 +88,10 @@ func TestGPSFusion(t *testing.T) {
 		}
 	}()
 
-	// 1) walk progress: live distance while the walk leg is current, then the
-	// street leg completes early (rider at the stop) → explicit waiting phase
-	waitFor(t, sink, "walk progress with distance", 10*time.Second, func(ev map[string]any) bool {
-		if ev["type"] != "progress" {
-			return false
-		}
-		_, hasDist := ev["distance_to_stop_m"]
-		return hasDist
-	})
-	waitFor(t, sink, "early street-leg completion → waiting at stop", 25*time.Second, func(ev map[string]any) bool {
-		return ev["type"] == "progress" && ev["status"] == "waiting"
+	// Stop arrival now emits waiting immediately, followed by zero remaining
+	// distance. Do not consume both while expecting a separate delayed handoff.
+	waitFor(t, sink, "immediate waiting at reached stop", 5*time.Second, func(ev map[string]any) bool {
+		return ev["type"] == "progress" && ev["status"] == "waiting" && ev["distance_to_stop_m"] == float64(0)
 	})
 
 	// 2) shape-only boarding fallback: the feed keeps reporting the trip but
@@ -109,16 +102,14 @@ func TestGPSFusion(t *testing.T) {
 	tripNum := rideOf(t, it)[len("test:"):]
 	srv.set(onTime("A1", "A2", "B1"))
 	go func() {
-		// Pause for >left_stop's production hold around 178 m from SA: it is
-		// outside the wander radius but below the boarding threshold. Ordered
-		// shape evidence must keep the guard quiet until the final ~350 m fix.
+		// Two ordered fixes cross 100m after the persistence window, without
+		// a later pump update racing with the rode-past stage below.
 		for _, p := range []struct {
 			lonE7 int32
 			hold  time.Duration
 		}{
-			{oLon + 12000, 3 * time.Second},
-			{oLon + 22500, 12 * time.Second},
-			{oLon + 44000, 0},
+			{oLon + 7000, 6 * time.Second},
+			{oLon + 14500, 0},
 		} {
 			target.Store(&[2]float64{saLat, float64(p.lonE7) / 1e7})
 			if p.hold > 0 {
@@ -174,15 +165,21 @@ boarded:
 	if stop, ok := dev["expected_stop"].(map[string]any); !ok || stop["name"] == "" {
 		t.Fatalf("deviation must carry the expected stop, got %v", dev["expected_stop"])
 	}
-	waitFor(t, sink, "recovery reroute", 30*time.Second, func(ev map[string]any) bool {
-		return ev["type"] == "reroute" && ev["reason"] == "stayed_on_vehicle"
+	// Only one stop remains in this fixture: a safe replacement requiring
+	// two stops of notice does not exist. Keep the occupied bus and search,
+	// never replace it with a walk from the rider's mid-road GPS position.
+	waitFor(t, sink, "safe recovery search", 30*time.Second, func(ev map[string]any) bool {
+		if ev["type"] == "reroute" {
+			t.Fatalf("rerouted without two downstream stops: %v", ev)
+		}
+		return ev["type"] == "warning" && ev["code"] == "stayed_on_vehicle"
 	})
 }
 
 // TestGPSRapidPickupBeforeWalkHandoff covers a bus arriving while the access
-// walk is still current. The rider stays at SA for less than atStopHold, then
-// follows A1's shape beyond the boarding threshold. Tracking must jump
-// directly walking -> riding: no synthetic waiting phase and no missed/reroute.
+// walk has not reached its planned arrival time. Reaching SA must immediately
+// switch to waiting, then ordered shape movement confirms boarding without
+// VehiclePosition or TripUpdate confirmation, and without a missed/reroute.
 func TestGPSRapidPickupBeforeWalkHandoff(t *testing.T) {
 	if testing.Short() {
 		t.Skip("wall-clock rapid-pickup E2E (~15s)")
@@ -267,8 +264,8 @@ func TestGPSRapidPickupBeforeWalkHandoff(t *testing.T) {
 		select {
 		case ev := <-sink:
 			t.Logf("event: %s %v", ev["type"], summarize(ev))
-			if ev["type"] == "progress" && ev["status"] == "waiting" {
-				t.Fatalf("rapid pickup emitted an intermediate waiting phase: %v", ev)
+			if ev["type"] == "progress" && ev["status"] == "waiting" && ev["leg_index"] != float64(1) {
+				t.Fatalf("stop arrival did not skip the access walk: %v", ev)
 			}
 			if ev["type"] == "warning" {
 				if code := ev["code"]; code == "too_slow" || code == "left_stop" || code == "missed_connection" {

@@ -34,6 +34,7 @@ import (
 	"math"
 	"time"
 
+	"gotransit/internal/engine"
 	"gotransit/internal/transit"
 )
 
@@ -54,7 +55,7 @@ const (
 	fixAccMax    = 150.0            // meters; fixes worse than this are discarded
 	fixAccCap    = 60.0             // how much of the accuracy inflates radii
 	vehGPSErr    = 30.0             // typical bus AVL error, always budgeted
-	nearStopBase = 40.0             // "you are at the stop"
+	nearStopBase = 30.0             // physical stop arrival, shared with the app
 	onVehBase    = 55.0             // co-located with the tracked vehicle
 	offVehBase   = 130.0            // clearly separated from the vehicle
 	confirmOn    = 20 * time.Second // co-location persistence → boarded
@@ -67,7 +68,7 @@ const (
 	// Shape-only boarding fallback. Once the rider has reached the stop, a
 	// sequence of fresh fixes progressing board -> alight inside this
 	// corridor is stronger evidence than an absent/stale vehicle position.
-	shapeBoardAwayM       = 200.0
+	shapeBoardAwayM       = 100.0
 	shapeBoardCorridorM   = 55.0
 	shapeBoardProgressM   = 30.0
 	shapeBoardStepM       = 5.0
@@ -252,11 +253,48 @@ func (g *gpsState) latchReachedStop(key string) {
 	}
 }
 
+// arriveAtBoardingStop runs before feasibility and clock advancement. Reaching
+// the next boarding stop completes all remaining access instructions at once.
+func (s *session) arriveAtBoardingStop(tt *transit.Timetable, o *transit.RTOverlay, now time.Time) {
+	if s.boarded || !s.gps.fresh(now) || s.legIdx >= len(s.it.Legs) || s.opaqueAt(tt, o, now, s.legIdx) {
+		return
+	}
+	idx := s.nextTransitIndex(s.legIdx)
+	if idx < 0 {
+		return
+	}
+	stop := s.it.Legs[idx].From
+	if s.gps.distTo(stop.Lat, stop.Lon) > nearStopBase {
+		return
+	}
+	s.atStop = &stop
+	s.gps.latchReachedStop(s.boardingKey(idx))
+	if r, ok := resolveRide(tt, &s.it.Legs[idx]); ok {
+		s.gpsShapeBoarding(tt, r, idx, now)
+	}
+	if idx > s.legIdx {
+		s.anchorRailAfterStreet(tt, idx-1, now)
+		s.legIdx = idx
+		s.gps.resetLegAnchors()
+		s.sendProgress("waiting", idx, false, "")
+	}
+}
+
+// reachedPlace only pins the current boarding, never a later transfer that
+// happens to share the same stop. It survives compatible replacements.
+func (s *session) reachedPlace() *engine.Place {
+	if s.atStop != nil && !s.boarded && s.legIdx < len(s.it.Legs) &&
+		s.it.Legs[s.legIdx].From.StopID == s.atStop.StopID {
+		return s.atStop
+	}
+	return nil
+}
+
 // gpsShapeBoarding recognizes the rider moving away on the planned vehicle's
 // own shape when Passed/VehiclePosition cannot corroborate boarding. It
 // returns following=true as soon as coherent movement exists so left_stop is
 // suspended while evidence accumulates; boarded becomes true only beyond
-// ~200 m and after sustained ordered progress.
+// 100 m and after sustained ordered progress.
 func (s *session) gpsShapeBoarding(tt *transit.Timetable, r ride, legIdx int, now time.Time) (following, boarded bool) {
 	if !s.gps.fresh(now) {
 		return false, false
@@ -336,7 +374,7 @@ func (s *session) gpsShapeBoarding(tt *transit.Timetable, r ride, legIdx int, no
 	if !following {
 		return false, false
 	}
-	clearAway := st.awayM >= shapeBoardAwayM+math.Min(st.accuracyM, fixAccCap)
+	clearAway := st.awayM >= shapeBoardAwayM
 	boarded = clearAway && st.movingFixes >= shapeBoardMovingFixes &&
 		st.lastAt.Sub(st.movingSince) >= shapeBoardHold
 	return following, boarded
@@ -543,7 +581,7 @@ func (s *session) gpsStopGuard(tt *transit.Timetable, now time.Time) *guardActio
 	d := s.gps.distTo(leg.From.Lat, leg.From.Lon)
 	buffer := cfg.Track.BoardBuffer
 
-	if d <= s.gps.radius(nearStopBase) {
+	if d <= nearStopBase {
 		s.gps.latchReachedStop(key)
 		// Seed/refresh ordered shape progress while the rider is still at the
 		// stop. That preserves a reliable origin even if several fixes arrive
@@ -578,6 +616,7 @@ func (s *session) gpsStopGuard(tt *transit.Timetable, now time.Time) *guardActio
 		late := now.Add(walkBack).Add(buffer).After(dep)
 		if hold(&s.gps.leftStopSince, late, now, guardHold) {
 			s.gps.leftStopSince = time.Time{}
+			s.atStop = nil
 			return &guardAction{"left_stop",
 				"you moved away from the stop and can no longer make the departure; recomputing from your position"}
 		}
@@ -613,6 +652,9 @@ func (s *session) emitWalkProgress(tt *transit.Timetable, now time.Time) {
 		tLat, tLon = leg.From.Lat, leg.From.Lon
 	}
 	d := s.gps.distTo(tLat, tLon)
+	if status == "waiting" && s.atStop != nil && s.atStop.StopID == leg.From.StopID {
+		d = 0
+	}
 	if s.gps.lastWalkDist >= 0 && math.Abs(d-s.gps.lastWalkDist) < walkDistStep {
 		return
 	}

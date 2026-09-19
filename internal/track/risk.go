@@ -14,7 +14,6 @@ import (
 	"time"
 
 	"gotransit/internal/engine"
-	"gotransit/internal/stats"
 	"gotransit/internal/transit"
 )
 
@@ -32,17 +31,6 @@ type riskState struct {
 	belowCritical int       // consecutive evaluations under risk_reroute_threshold
 	breachAt      time.Time // first time under the reroute threshold
 	lastLevel     string    // last emitted level (dedupe)
-}
-
-// residualSigma: uncertainty of an RT-tracked vehicle shrinks as it
-// approaches — near the stop the probability converges to the deterministic
-// verdict of refreshTimes.
-func residualSigma(remaining time.Duration) float64 {
-	s := 20 + 0.15*remaining.Seconds()
-	if s > 120 {
-		s = 120
-	}
-	return s
 }
 
 // evaluateRisk scores every remaining connection and acts on the risky ones.
@@ -90,39 +78,23 @@ func (s *session) evaluateRisk(tt *transit.Timetable, o *transit.RTOverlay, now 
 		if hasLT && !lt.Depart.IsZero() {
 			depRT = lt.Depart
 		}
-		slack := depRT.Sub(arrivalAtStop).Seconds()
-
-		conn := stats.Conn{
-			SlackSec:      slack,
-			WalkSec:       walkSec,
-			WalkSigmaFrac: cfg.Routing.WalkSigmaFrac,
-		}
-		// Incoming side: the vehicle (or walk) bringing the rider here.
+		outgoing := *leg
+		outgoing.Depart = depRT
+		outgoing.Realtime = leg.Realtime || (hasLT && lt.Realtime)
+		var incoming *engine.Leg
 		if prevTransit >= 0 {
-			pl := &s.it.Legs[prevTransit]
-			plt, ok := byIdx[prevTransit]
-			remaining := time.Duration(0)
-			if ok {
-				remaining = plt.Arrive.Sub(now)
+			copy := s.it.Legs[prevTransit]
+			if plt, ok := byIdx[prevTransit]; ok {
+				copy.Arrive = plt.Arrive
+				copy.Realtime = copy.Realtime || plt.Realtime
 			}
-			if pl.Realtime || (ok && plt.Realtime) {
-				conn.ArrSigma = residualSigma(remaining)
-			} else if h, hok := s.legDist(tt, stats.Arrival, pl); hok {
-				conn.ArrDist = h
-			} else {
-				conn.ArrSigma = 180
-			}
+			incoming = &copy
 		}
-		// Outgoing side: the bus to catch.
-		if leg.Realtime || (hasLT && lt.Realtime) {
-			conn.DepSigma = residualSigma(depRT.Sub(now))
-		} else if h, hok := s.legDist(tt, stats.Departure, leg); hok {
-			conn.DepDist = h
-		} else {
-			conn.DepSigma = 180
+		p := s.t.E.ConnectionProbability(tt, &outgoing, incoming, arrivalAtStop, walkSec, now)
+		if i == s.legIdx && s.atStop != nil && incoming == nil {
+			p = 1 // a reached stop stays reached even while a prediction is overdue
 		}
 
-		p := stats.Catch(conn)
 		st := s.risk[i]
 		if st == nil {
 			st = &riskState{}
@@ -182,7 +154,7 @@ func (s *session) evaluateRisk(tt *transit.Timetable, o *transit.RTOverlay, now 
 		if st.belowCritical >= confirm && !st.breachAt.IsZero() &&
 			now.Sub(st.breachAt) >= cfg.Realtime.RiskMinBreach &&
 			now.Sub(s.lastRR) >= betterArrivalCooldown &&
-			s.rerouteAllowed(tt) && !s.boardingImminent(now) {
+			s.rerouteAllowed(tt) && !s.boardingImminent(now) && !s.shapeBoardingInProgress(tt, now) {
 			msg := fmt.Sprintf("connection at %s is at risk (%.0f%%); rerouting before it is lost",
 				leg.From.Name, p*100)
 			if err := s.reroute(tt, o, now, "connection_risk", msg, 10*time.Minute); err == nil {
@@ -219,23 +191,6 @@ func streetTimeRemaining(leg *engine.Leg, lt legTime, hasLT, current bool, now t
 		return 0
 	}
 	return remaining
-}
-
-// legDist queries the learned distribution for a leg's route at its local
-// hour, centered when the trip already has realtime data.
-func (s *session) legDist(tt *transit.Timetable, kind stats.Kind, leg *engine.Leg) (*stats.Hist, bool) {
-	if s.t.E == nil || s.t.E.Stats == nil || leg.Route == nil {
-		return nil, false
-	}
-	local := leg.Depart.In(tt.TZ)
-	h, ok := s.t.E.Stats.Dist(kind, leg.Route.ID, stats.DayTypeOf(local), local.Hour())
-	if !ok {
-		return nil, false
-	}
-	if leg.Realtime {
-		h = stats.Centered(h)
-	}
-	return &h, true
 }
 
 func round3(x float64) float64 { return float64(int(x*1000+0.5)) / 1000 }

@@ -102,6 +102,9 @@ func (e *Engine) LookupItinerary(id string) (*CachedItinerary, bool) {
 type StopPlanSource struct {
 	PriorRail  bool
 	ReadySlack time.Duration
+	// Onboard retains the actual incoming ride, including geometry and arrival
+	// uncertainty. Seeds must be reachable downstream stops of this trip.
+	Onboard *Leg
 }
 
 // PlanFromStops runs a transit plan whose sources are stops with known
@@ -155,9 +158,105 @@ func (e *Engine) PlanFromStops(seeds map[int32]time.Time, tLatF, tLonF float64, 
 	}
 	req := Request{ToLat: tLatF, ToLon: tLonF, Mode: "transit", When: when, Num: num}
 	its := e.runRaptor(gb, tb, req, when, 0, 0, tLat, tLon, &acc, &egr)
-	e.annotateRisk(its)
+	if source.Onboard != nil {
+		// Walking is only possible AFTER alighting at a supplied future stop.
+		// RAPTOR requires a ride and therefore cannot return these tails itself.
+		for stop, at := range seeds {
+			sec, ok := egr.sec[stop]
+			if !ok {
+				continue
+			}
+			leg := e.stopStreetLeg(gb, tb, "walk", tLat, tLon, stop, true)
+			leg.From, leg.To = stopPlace(tt, stop), Place{Lat: tLatF, Lon: tLonF}
+			leg.Depart, leg.Arrive = at, at.Add(time.Duration(sec)*time.Second)
+			leg.DurationS = int(sec)
+			reconcileLegSteps(&leg)
+			its = append(its, Itinerary{Legs: []Leg{leg}, Arrive: leg.Arrive})
+		}
+		retained := its[:0]
+		for _, it := range its {
+			if e.retainOnboard(tt, &it, source.Onboard, seeds, when) {
+				retained = append(retained, it)
+			}
+		}
+		its = retained
+	}
+	e.annotateRisk(its, when)
 	its = dedupeRank(its, num)
 	e.annotateLive(its, when)
 	e.remember(its, req)
 	return its, nil
+}
+
+// retainOnboard builds the part a rider cannot teleport past. It also merges
+// a continuation on the current trip instead of inventing a second boarding.
+func (e *Engine) retainOnboard(tt *transit.Timetable, it *Itinerary, current *Leg, seeds map[int32]time.Time, now time.Time) bool {
+	if len(it.Legs) == 0 {
+		return false
+	}
+	trip, ok := tt.TripIdx[current.TripID]
+	if !ok {
+		return false
+	}
+	pat := tt.PatternOfTrip(trip)
+	board, alight := -1, -1
+	var seedAt time.Time
+	for pos, stop := range tt.PatternStops(pat) {
+		if board < 0 && tt.StopID[stop] == current.From.StopID {
+			board = pos
+		}
+		if at, seeded := seeds[stop]; seeded && pos > board && board >= 0 &&
+			tt.StopID[stop] == it.Legs[0].From.StopID && !at.Before(now) {
+			alight = pos
+			seedAt = at
+			break
+		}
+	}
+	if board < 0 || alight <= board {
+		return false
+	}
+	base := seedAt.Add(-time.Duration(tt.TripArr(trip, uint16(alight))) * time.Second)
+	tail := it.Legs
+	if tail[0].Mode == "transit" && tail[0].TripID == current.TripID {
+		found := false
+		for pos, stop := range tt.PatternStops(pat) {
+			if pos >= alight && tt.StopID[stop] == tail[0].To.StopID {
+				alight, found = pos, true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+		tail = tail[1:]
+	}
+	ride := e.transitLeg(tt, transit.RLeg{Ride: true, Trip: trip, Pattern: pat, Board: uint16(board), Alight: uint16(alight)}, base)
+	ride.Boarded = true
+	ride.CatchProb, ride.RiskLevel = 1, "ok"
+	// The seed's readiness allowance was used by RAPTOR to filter departures.
+	// Street legs describe actual movement, so do not count that allowance as
+	// additional walking and then subtract it a second time in the risk model.
+	at := ride.Arrive
+	for i := range tail {
+		if tail[i].Mode == "transit" {
+			break
+		}
+		tail[i].Depart = at
+		tail[i].Arrive = at.Add(time.Duration(tail[i].DurationS) * time.Second)
+		at = tail[i].Arrive
+	}
+	it.Legs = append([]Leg{ride}, tail...)
+	it.Arrive = it.Legs[len(it.Legs)-1].Arrive
+	it.Depart = now
+	it.DurationS = int(it.Arrive.Sub(now).Seconds())
+	it.Transfers = 0
+	it.sig = ""
+	for _, leg := range it.Legs {
+		if leg.Mode == "transit" {
+			it.Transfers++
+			it.sig += leg.TripID + ":" + leg.To.StopID + ";"
+		}
+	}
+	it.Transfers--
+	return true
 }

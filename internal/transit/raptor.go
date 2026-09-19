@@ -305,6 +305,7 @@ func (r *Raptor) scanPattern(q Query, k int, p uint32, startPos uint16, active [
 	stops := tt.PatternStops(p)
 	tLo, tHi := tt.PatternTrips(p)
 	prevTau := r.tau[k-1]
+	railPattern := r.patternRailLike(p)
 
 	trip := int64(-1)
 	var boardPos uint16
@@ -336,10 +337,11 @@ func (r *Raptor) scanPattern(q Query, k int, p uint32, startPos uint16, active [
 			continue
 		}
 		wait := uint32(0)
-		if r.kind[k-1][s] == pkRide {
+		if _, _, hasIncoming := r.priorRide(k-1, s); hasIncoming && (!railPattern || r.kind[k-1][s] == pkRide) {
+			// Crossing the road does not remove the boarding allowance.
 			wait = q.SlackSec
 		}
-		if r.patternRailLike(p) {
+		if railPattern {
 			if priorArr, ok := r.priorRailSource(k-1, s); ok {
 				// Onboard replans seed a ready time (normally arrival+15s),
 				// but rail→rail transfer time is measured from the incoming

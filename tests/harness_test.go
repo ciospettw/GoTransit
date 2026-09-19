@@ -49,7 +49,7 @@ type worldOpts struct {
 	midStopShape bool
 }
 
-func buildWorld(t *testing.T, opts worldOpts) *world {
+func buildWorld(t testing.TB, opts worldOpts) *world {
 	t.Helper()
 	g := graph.SyntheticGrid(4, 4, oLat, oLon, step)
 
