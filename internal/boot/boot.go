@@ -17,6 +17,7 @@ import (
 	"gotransit/internal/api"
 	"gotransit/internal/config"
 	"gotransit/internal/engine"
+	"gotransit/internal/gbfs"
 	"gotransit/internal/graph"
 	"gotransit/internal/rt"
 	"gotransit/internal/stats"
@@ -41,7 +42,8 @@ type Runtime struct {
 	// OnReady runs once, when the boot sequence completes.
 	OnReady func()
 
-	rtMgr atomic.Pointer[rt.Manager]
+	rtMgr   atomic.Pointer[rt.Manager]
+	gbfsMgr atomic.Pointer[gbfs.Manager]
 }
 
 // New wires engine, updater and API server for cfg.
@@ -59,6 +61,10 @@ func New(cfg *config.Config, log *slog.Logger) *Runtime {
 // RTManager returns the GTFS-RT manager, or nil before boot completes or
 // when no source is configured.
 func (r *Runtime) RTManager() *rt.Manager { return r.rtMgr.Load() }
+
+// GBFSManager returns the shared-mobility manager, or nil when no [[gbfs]]
+// source is configured.
+func (r *Runtime) GBFSManager() *gbfs.Manager { return r.gbfsMgr.Load() }
 
 // retryForever runs fn with capped exponential backoff: a set-and-forget
 // daemon must survive flaky sources and rate limits at boot time too.
@@ -220,6 +226,30 @@ func (r *Runtime) Run() {
 	e.SetTimetable(tt)
 	log.Info("timetable ready", "stats", cst.String(), "tz", tt.TZ.String())
 	e.LogExclusions(func(format string, a ...any) { log.Warn(fmt.Sprintf(format, a...)) })
+
+	// ---- GBFS shared mobility: version-neutral discovery + live snapshots ----
+	if len(cfg.GBFS) > 0 {
+		sources := make([]gbfs.Source, 0, len(cfg.GBFS))
+		for _, f := range cfg.GBFS {
+			sources = append(sources, gbfs.Source{Name: f.Name, URL: f.URL, Language: f.Language,
+				Poll: f.Poll, MaxAge: f.MaxAge, AllowInsecure: f.AllowInsecure, Headers: f.Headers})
+		}
+		mgr := gbfs.NewManager(log, sources)
+		// Publish the empty manager before the first network round-trip: an
+		// early bike_transit query may fall back to transit, but must never
+		// resurrect the legacy imaginary personal bike while GBFS boots.
+		e.GBFS, e.GBFSChanged = mgr, mgr.Changed
+		r.gbfsMgr.Store(mgr)
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		if err := mgr.Refresh(ctx); err != nil {
+			// Public transport remains usable. bike_transit simply falls back
+			// to transit until a background refresh produces a fresh snapshot.
+			log.Warn("initial GBFS load failed; retrying in background", "err", err)
+		}
+		cancel()
+		mgr.Start(context.Background())
+		log.Info("GBFS shared mobility live", "sources", len(sources))
+	}
 
 	// ---- GTFS-Realtime: pollers + live tracking ----
 	var sources []rt.Source

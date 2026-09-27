@@ -59,6 +59,16 @@ url  = "https://proxy.busone.app/trenitalia/gtfs.zip"
 rt_trip_updates      = "https://proxy.busone.app/trenitalia/gtfs-rt/trip-updates.pb"
 rt_vehicle_positions = "https://proxy.busone.app/trenitalia/gtfs-rt/vehicle-positions.pb"
 
+# Optional shared mobility. Point each entry at gbfs.json; GoTransit discovers
+# v1.x, v2.x and v3.x station/vehicle/type/geofence endpoints automatically.
+# [[gbfs]]
+# name = "city-bikes"
+# url  = "https://operator.example/gbfs.json"
+# language = "en"       # v1.x only; falls back to en/first language
+# poll = "20s"
+# max_age = "5m"        # fail closed when realtime availability is older
+# headers = ["Authorization: Bearer secret"]
+
 # [realtime]                    # live itineraries + tracking thresholds
 # reroute_min_saving    = "5m"  # only push a reroute when it saves this much
 # rt_confirm_lead       = "10m" # warn if a leg is still schedule-only this close
@@ -74,6 +84,7 @@ rt_vehicle_positions = "https://proxy.busone.app/trenitalia/gtfs-rt/vehicle-posi
 # [routing]            # defaults shown; uncomment to change
 # walk_speed_kmh  = 4.8
 # bike_speed_kmh  = 15.0
+# scooter_speed_kmh = 20.0
 # max_walk_access = "12m"
 # max_bike_access = "18m"
 # max_transfers   = 4
@@ -83,6 +94,13 @@ rt_vehicle_positions = "https://proxy.busone.app/trenitalia/gtfs-rt/vehicle-posi
 # transfer_radius_m = 400
 # snap_radius_m     = 300
 # bike_transit_min_saving = "5m"
+# shared_pickup_walk  = "8m"
+# shared_dropoff_walk = "6m"
+# shared_unlock_time  = "45s"
+# shared_park_time    = "30s"
+# shared_candidates   = 12
+# battery_reserve_ratio = 0.15
+# battery_reserve_m     = 500
 # car_heuristic   = "fast"   # "exact" for provably optimal car routes
 # max_itineraries = 4
 `

@@ -13,6 +13,7 @@ import (
 
 	"gotransit/internal/config"
 	"gotransit/internal/engine"
+	"gotransit/internal/geo"
 	"gotransit/internal/rt"
 	"gotransit/internal/transit"
 )
@@ -148,6 +149,7 @@ type session struct {
 	railReadyAt               map[int]time.Time  // fixed station-arrival/change anchors, by outgoing rail leg
 	gps                       gpsState           // client position evidence (optional)
 	risk                      map[int]*riskState // live connection-risk hysteresis, per leg
+	rentalStarted             map[int]bool       // GBFS active rentals vanish from public availability by design
 }
 
 // Run drives one tracking session until arrival, error or ctx cancellation.
@@ -163,7 +165,7 @@ func (t *Tracker) Run(ctx context.Context, itID string, sink Sink, fixes <-chan 
 		it: cached.It, origArr: cached.It.Arrive,
 		liveMode: cached.It.Live,
 		lastEmit: map[int]legTime{}, warned: map[string]bool{},
-		gps: newGPSState(),
+		gps: newGPSState(), rentalStarted: map[int]bool{},
 	}
 	s.resetRailReady()
 	if len(s.it.Legs) > 0 {
@@ -187,13 +189,18 @@ func (t *Tracker) Run(ctx context.Context, itID string, sink Sink, fixes <-chan 
 	defer tick.Stop()
 	for {
 		var changed <-chan struct{}
+		var gbfsChanged <-chan struct{}
 		if t.Mgr != nil {
 			changed = t.Mgr.Changed()
+		}
+		if t.E.GBFSChanged != nil {
+			gbfsChanged = t.E.GBFSChanged()
 		}
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-changed:
+		case <-gbfsChanged:
 		case <-tick.C:
 		case f, ok := <-fixes:
 			if !ok {
@@ -244,6 +251,16 @@ func (s *session) evaluate(now time.Time) (bool, error) {
 	s.setOpaque(opaque)
 	if !opaque {
 		s.emitWalkProgress(tt, now)
+	}
+
+	// A GBFS vehicle is not a static POI. Until the rental starts, keep
+	// checking the exact bike/scooter, station pool, battery range and return
+	// capacity. A failure invalidates the whole journey, including while the
+	// rider is walking or on a bus, so the normal full replan can choose an
+	// earlier/later alight, another vehicle, or transit-only service.
+	if idx, reason, message, unavailable := s.sharedUnavailable(now); unavailable {
+		s.t.Log.Debug("shared vehicle unavailable", "leg", idx, "reason", reason)
+		return false, s.reroute(tt, o, now, "shared_vehicle_unavailable", message, 0)
 	}
 
 	// GPS silence after fixes were flowing: tell the client once and keep
@@ -311,6 +328,72 @@ func (s *session) evaluate(now time.Time) (bool, error) {
 		s.tryBetterArrival(tt, o, now)
 	}
 	return false, nil
+}
+
+// sharedUnavailable checks every not-yet-started rental in the remaining
+// itinerary. Once its rental leg has begun the vehicle correctly disappears
+// from vehicle_status (GBFS excludes active rentals), so pickup availability
+// must no longer be interpreted as a failure.
+func (s *session) sharedUnavailable(now time.Time) (int, string, string, bool) {
+	if s.t.E.GBFS == nil {
+		return 0, "", "", false
+	}
+	snap := s.t.E.GBFS.Snapshot()
+	for i := s.legIdx; i < len(s.it.Legs); i++ {
+		leg := &s.it.Legs[i]
+		if leg.Rental == nil {
+			continue
+		}
+		if i == s.legIdx && !now.Before(leg.Depart) && s.rentalStarted[i] {
+			continue // active rental; absence from GBFS is expected by spec
+		}
+		// Availability is current, while scheduled geofences must be checked
+		// at the future rental time. Snapshot.Check keeps those two clocks
+		// separate and the tracker repeats this on every GBFS change.
+		validationAt := now
+		if leg.Depart.After(validationAt) {
+			validationAt = leg.Depart
+		}
+		result := snap.Check(*leg.Rental, validationAt,
+			s.t.Cfg.Routing.BatteryReserveRatio, s.t.Cfg.Routing.BatteryReserveM)
+		if result.Available && !snap.PathAllowed(leg.Rental.Feed, leg.Rental.VehicleTypeID,
+			decodeRentalPolyline(leg.Polyline), validationAt) {
+			result.Available = false
+			result.Reason = "route_no_longer_allowed"
+		}
+		if result.Available {
+			leg.Rental.CurrentRangeM = result.CurrentRangeM
+			leg.Rental.BatteryPercent = result.BatteryPercent
+			if i == s.legIdx && !now.Before(leg.Depart) {
+				s.rentalStarted[i] = true // final acquisition-time check succeeded
+			}
+			continue
+		}
+		message := "the assigned shared vehicle is no longer available; recalculating the complete journey"
+		switch result.Reason {
+		case "battery_range_insufficient", "battery_range_unknown":
+			message = "the assigned vehicle no longer has a safe battery range for this ride; recalculating the complete journey"
+		case "dropoff_station_unavailable", "dropoff_no_longer_allowed":
+			message = "the planned shared-vehicle return is no longer available; recalculating the complete journey"
+		case "pickup_no_longer_allowed":
+			message = "the assigned shared vehicle can no longer be rented here; recalculating the complete journey"
+		case "route_no_longer_allowed":
+			message = "the planned shared-vehicle route now crosses a restricted area; recalculating the complete journey"
+		case "gbfs_feed_stale", "no_gbfs_snapshot":
+			message = "shared-vehicle availability can no longer be verified; recalculating the complete journey"
+		}
+		return i, result.Reason, message, true
+	}
+	return 0, "", "", false
+}
+
+func decodeRentalPolyline(encoded string) [][2]float64 {
+	lats, lons := geo.DecodePolyline(encoded)
+	points := make([][2]float64, len(lats))
+	for i := range lats {
+		points[i] = [2]float64{float64(lats[i]) / 1e7, float64(lons[i]) / 1e7}
+	}
+	return points
 }
 
 // shapeBoardingInProgress protects the short evidence window between leaving
@@ -1135,6 +1218,7 @@ func (s *session) switchTo(it engine.Itinerary, reason, msg string, saving int) 
 	s.lastVeh = evVehicle{}
 	s.warned = map[string]bool{} // fresh plan, fresh guard state
 	s.risk = map[int]*riskState{}
+	s.rentalStarted = map[int]bool{}
 	s.opaque = false
 	s.resetRailReady()
 	s.gps.resetLegAnchors()
@@ -1168,6 +1252,10 @@ func sameRides(a, b []engine.Leg) bool {
 func legSignature(l *engine.Leg) string {
 	if l.Mode == "transit" {
 		return "t|" + l.TripID + "|" + l.From.StopID + "|" + l.To.StopID
+	}
+	if l.Rental != nil {
+		return fmt.Sprintf("r|%s|%s|%s|%s|%s", l.Rental.Feed, l.Rental.VehicleID,
+			l.Rental.VehicleTypeID, l.Rental.PickupStationID, l.Rental.DropoffStationID)
 	}
 	return fmt.Sprintf("%s|%.4f,%.4f|%.4f,%.4f", l.Mode, l.From.Lat, l.From.Lon, l.To.Lat, l.To.Lon)
 }
@@ -1230,9 +1318,11 @@ func (s *session) replan(tt *transit.Timetable, o *transit.RTOverlay, now time.T
 			seeds[stops[pos]] = at
 		}
 		source := engine.StopPlanSource{
-			PriorRail:  railLikeLeg(tt, leg),
-			ReadySlack: s.t.Cfg.Routing.TransferSlack,
-			Onboard:    leg,
+			PriorRail:     railLikeLeg(tt, leg),
+			ReadySlack:    s.t.Cfg.Routing.TransferSlack,
+			Onboard:       leg,
+			Mode:          s.req.Mode,
+			SharedVehicle: s.req.SharedVehicle,
 		}
 		its, err := s.t.E.PlanFromStops(seeds, dLat, dLon, now, 12, source)
 		if err != nil || len(its) == 0 {
@@ -1245,7 +1335,8 @@ func (s *session) replan(tt *transit.Timetable, o *transit.RTOverlay, now time.T
 			if stopID != stop.StopID {
 				continue
 			}
-			its, err := s.t.E.PlanFromStops(map[int32]time.Time{int32(id): now}, dLat, dLon, now, 12, engine.StopPlanSource{})
+			its, err := s.t.E.PlanFromStops(map[int32]time.Time{int32(id): now}, dLat, dLon, now, 12,
+				engine.StopPlanSource{Mode: s.req.Mode, SharedVehicle: s.req.SharedVehicle})
 			if err == nil {
 				return s.pickFeasible(its, now)
 			}
@@ -1259,7 +1350,12 @@ func (s *session) replan(tt *transit.Timetable, o *transit.RTOverlay, now time.T
 	req := s.req
 	req.FromLat, req.FromLon = lat, lon
 	req.ToLat, req.ToLon = dLat, dLon
-	req.Mode = "transit"
+	// Preserve multimodal intent. bike/scooter_transit already includes the
+	// transit-only walk/walk variant, so all alternatives compete together
+	// and a faster bus wins over a slower replacement rental.
+	if req.Mode == "" {
+		req.Mode = "transit"
+	}
 	req.When = now
 	req.ArriveBy = false
 	req.Num = 12
@@ -1360,11 +1456,11 @@ func (s *session) walkFallback(now time.Time, dLat, dLon float64) (engine.Itiner
 }
 
 // pickBest chooses the reroute target with three rules, in order:
-//  1. realtime confidence — never move a rider onto a schedule-only bus when
-//     an RT-confirmed (trip updates) alternative exists; delays are already
-//     folded into the times, so a late-but-catchable bus competes fairly;
-//  2. earlier arrival (beyond a 60s tie window);
-//  3. less walking — the same vehicle at a nearer stop beats a farther stop
+//  1. earlier risk-adjusted arrival (beyond a 60s tie window). This is
+//     intentionally mode-neutral: a faster bus must beat a slower replacement
+//     bike/scooter, and vice versa;
+//  2. realtime confidence inside the arrival tie window;
+//  3. less street time — the same vehicle at a nearer stop beats a farther stop
 //     with an earlier vehicle ETA: you walk less and arrive when you arrive.
 func pickBest(its []engine.Itinerary, wantLive bool) engine.Itinerary {
 	class := func(it *engine.Itinerary) int {
@@ -1398,12 +1494,12 @@ func pickBest(its []engine.Itinerary, wantLive bool) engine.Itinerary {
 		// a fragile connection must not win the reroute
 		ea, eb := a.ExpectedArrive(), b.ExpectedArrive()
 		switch {
-		case cb < ca:
-			best = i
-		case cb > ca:
 		case eb.Before(ea.Add(-60 * time.Second)):
 			best = i
 		case ea.Before(eb.Add(-60 * time.Second)):
+		case cb < ca:
+			best = i
+		case cb > ca:
 		case walk(b) < walk(a):
 			best = i
 		}

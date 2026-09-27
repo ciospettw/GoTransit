@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"gotransit/internal/config"
+	"gotransit/internal/gbfs"
 	"gotransit/internal/graph"
 	"gotransit/internal/stats"
 	"gotransit/internal/transit"
@@ -63,6 +64,12 @@ type Engine struct {
 	// RTStats/RTVersion are wired by the realtime manager (nil-safe).
 	RTStats   func() any
 	RTChanged func() <-chan struct{}
+	// GBFS is the live shared-mobility source used by bike/scooter+transit.
+	// Nil preserves the legacy personal-bike behavior for deployments that
+	// do not configure any [[gbfs]] system.
+	GBFS             *gbfs.Manager
+	GBFSChanged      func() <-chan struct{}
+	SharedConfigured bool
 
 	// planned-itinerary cache: tokens handed to clients for /v1/track
 	itMu  sync.Mutex
@@ -87,7 +94,8 @@ type CachedItinerary struct {
 
 // New creates an engine (graph/timetable installed separately during boot).
 func New(cfg *config.Config) *Engine {
-	return &Engine{Cfg: cfg, Started: time.Now(), itins: map[string]*CachedItinerary{}}
+	return &Engine{Cfg: cfg, Started: time.Now(), itins: map[string]*CachedItinerary{},
+		SharedConfigured: len(cfg.GBFS) > 0}
 }
 
 // SetGraph installs a new street graph (zero-downtime swap).
@@ -123,14 +131,15 @@ func (e *Engine) Timezone() *time.Location {
 
 // Status is the /v1/status payload.
 type Status struct {
-	Uptime        string        `json:"uptime"`
-	HeapMB        float64       `json:"heap_mb"`
-	Queries       int64         `json:"queries"`
-	Graph         GraphStatus   `json:"graph"`
-	Transit       TransitStatus `json:"transit"`
-	Realtime      any           `json:"realtime,omitempty"`
-	Excluded      any           `json:"excluded_routes,omitempty"`
-	UnsnappedStop int           `json:"stops_without_street_access"`
+	Uptime         string        `json:"uptime"`
+	HeapMB         float64       `json:"heap_mb"`
+	Queries        int64         `json:"queries"`
+	Graph          GraphStatus   `json:"graph"`
+	Transit        TransitStatus `json:"transit"`
+	Realtime       any           `json:"realtime,omitempty"`
+	SharedMobility any           `json:"shared_mobility,omitempty"`
+	Excluded       any           `json:"excluded_routes,omitempty"`
+	UnsnappedStop  int           `json:"stops_without_street_access"`
 }
 
 type GraphStatus struct {
@@ -189,6 +198,9 @@ func (e *Engine) Status() Status {
 	}
 	if e.RTStats != nil {
 		st.Realtime = e.RTStats()
+	}
+	if e.GBFS != nil {
+		st.SharedMobility = e.GBFS.Status()
 	}
 	return st
 }

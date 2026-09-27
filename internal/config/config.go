@@ -30,6 +30,18 @@ type Feed struct {
 	RTPoll             time.Duration
 }
 
+// GBFSFeed is one shared-mobility system. URL points at its gbfs.json
+// auto-discovery endpoint; all linked feeds are discovered version-neutrally.
+type GBFSFeed struct {
+	Name          string
+	URL           string
+	Language      string
+	Poll          time.Duration
+	MaxAge        time.Duration
+	AllowInsecure bool
+	Headers       map[string]string
+}
+
 // Local reports whether the source is a filesystem path.
 func (f Feed) Local() bool { return IsLocal(f.URL) }
 
@@ -64,6 +76,7 @@ type Config struct {
 	}
 
 	Feeds []Feed
+	GBFS  []GBFSFeed
 
 	Realtime struct {
 		// a reroute is only pushed when it beats the current plan by this much
@@ -124,8 +137,9 @@ type Config struct {
 	}
 
 	Routing struct {
-		WalkSpeedKmh float64
-		BikeSpeedKmh float64
+		WalkSpeedKmh    float64
+		BikeSpeedKmh    float64
+		ScooterSpeedKmh float64
 
 		MaxWalkAccess time.Duration // max walk to/from a stop
 		MaxBikeAccess time.Duration // max ride to/from a stop (bike+transit)
@@ -145,6 +159,18 @@ type Config struct {
 		// bike legs feel more expensive than the raw ride time (parking,
 		// locking, effort): multiplied cost used when comparing to walking.
 		BikeCostFactor float64
+
+		// Shared mobility access/egress. A bike/scooter is only considered
+		// when its pickup and legal return are within these walking windows.
+		SharedPickupWalk  time.Duration
+		SharedDropoffWalk time.Duration
+		SharedUnlock      time.Duration
+		SharedPark        time.Duration
+		SharedCandidates  int
+		// Motorized GBFS vehicles must report enough current range for the
+		// routed distance plus both safety margins.
+		BatteryReserveRatio float64
+		BatteryReserveM     float64
 
 		CarHeuristic string // "fast" (weighted A*, ~few % from optimal) or "exact"
 
@@ -173,6 +199,7 @@ func Default() *Config {
 	c.OSM.Poll = 6 * time.Hour
 	c.Routing.WalkSpeedKmh = 4.8
 	c.Routing.BikeSpeedKmh = 15
+	c.Routing.ScooterSpeedKmh = 20
 	c.Routing.MaxWalkAccess = 12 * time.Minute
 	c.Routing.MaxBikeAccess = 18 * time.Minute
 	c.Routing.MaxTransfers = 4
@@ -183,6 +210,13 @@ func Default() *Config {
 	c.Routing.SnapRadiusM = 300
 	c.Routing.BikeTransitMinSaving = 5 * time.Minute
 	c.Routing.BikeCostFactor = 1.25
+	c.Routing.SharedPickupWalk = 8 * time.Minute
+	c.Routing.SharedDropoffWalk = 6 * time.Minute
+	c.Routing.SharedUnlock = 45 * time.Second
+	c.Routing.SharedPark = 30 * time.Second
+	c.Routing.SharedCandidates = 12
+	c.Routing.BatteryReserveRatio = 0.15
+	c.Routing.BatteryReserveM = 500
 	c.Routing.CarHeuristic = "fast"
 	c.Routing.MaxItineraries = 4
 	c.Realtime.RerouteMinSaving = 5 * time.Minute
@@ -280,6 +314,41 @@ func parse(data []byte) (*Config, error) {
 		c.Feeds = append(c.Feeds, f)
 	}
 
+	for i, ft := range t.Tables("gbfs") {
+		f := GBFSFeed{
+			Name: ft.Str("name", ""), URL: ft.Str("url", ""), Language: ft.Str("language", "en"),
+			AllowInsecure: ft.Bool("allow_insecure", false),
+		}
+		if f.Poll, err = ft.Dur("poll", 20*time.Second); err != nil {
+			return nil, err
+		}
+		if f.MaxAge, err = ft.Dur("max_age", 5*time.Minute); err != nil {
+			return nil, err
+		}
+		for _, h := range ft.Strs("headers") {
+			k, v, ok := strings.Cut(h, ":")
+			k, v = strings.TrimSpace(k), strings.TrimSpace(v)
+			if !ok || k == "" {
+				return nil, fmt.Errorf("config: [[gbfs]] %q: headers entries must be \"Name: value\", got %q", ft.Str("name", ""), h)
+			}
+			if f.Headers == nil {
+				f.Headers = map[string]string{}
+			}
+			f.Headers[k] = v
+		}
+		if f.URL == "" {
+			return nil, fmt.Errorf("config: [[gbfs]] #%d has no url", i+1)
+		}
+		if f.Name == "" {
+			return nil, fmt.Errorf("config: [[gbfs]] #%d (%s) has no name", i+1, f.URL)
+		}
+		f.Name = strings.ToLower(f.Name)
+		if strings.ContainsAny(f.Name, " :/\\") {
+			return nil, fmt.Errorf("config: GBFS feed name %q must be a short slug", f.Name)
+		}
+		c.GBFS = append(c.GBFS, f)
+	}
+
 	rt := t.Table("realtime")
 	if c.Realtime.RerouteMinSaving, err = rt.Dur("reroute_min_saving", c.Realtime.RerouteMinSaving); err != nil {
 		return nil, err
@@ -329,6 +398,7 @@ func parse(data []byte) (*Config, error) {
 	r := t.Table("routing")
 	c.Routing.WalkSpeedKmh = r.Float("walk_speed_kmh", c.Routing.WalkSpeedKmh)
 	c.Routing.BikeSpeedKmh = r.Float("bike_speed_kmh", c.Routing.BikeSpeedKmh)
+	c.Routing.ScooterSpeedKmh = r.Float("scooter_speed_kmh", c.Routing.ScooterSpeedKmh)
 	if c.Routing.MaxWalkAccess, err = r.Dur("max_walk_access", c.Routing.MaxWalkAccess); err != nil {
 		return nil, err
 	}
@@ -351,6 +421,21 @@ func parse(data []byte) (*Config, error) {
 		return nil, err
 	}
 	c.Routing.BikeCostFactor = r.Float("bike_cost_factor", c.Routing.BikeCostFactor)
+	if c.Routing.SharedPickupWalk, err = r.Dur("shared_pickup_walk", c.Routing.SharedPickupWalk); err != nil {
+		return nil, err
+	}
+	if c.Routing.SharedDropoffWalk, err = r.Dur("shared_dropoff_walk", c.Routing.SharedDropoffWalk); err != nil {
+		return nil, err
+	}
+	if c.Routing.SharedUnlock, err = r.Dur("shared_unlock_time", c.Routing.SharedUnlock); err != nil {
+		return nil, err
+	}
+	if c.Routing.SharedPark, err = r.Dur("shared_park_time", c.Routing.SharedPark); err != nil {
+		return nil, err
+	}
+	c.Routing.SharedCandidates = int(r.Int("shared_candidates", int64(c.Routing.SharedCandidates)))
+	c.Routing.BatteryReserveRatio = r.Float("battery_reserve_ratio", c.Routing.BatteryReserveRatio)
+	c.Routing.BatteryReserveM = r.Float("battery_reserve_m", c.Routing.BatteryReserveM)
 	c.Routing.CarHeuristic = r.Str("car_heuristic", c.Routing.CarHeuristic)
 	c.Routing.MaxItineraries = int(r.Int("max_itineraries", int64(c.Routing.MaxItineraries)))
 	c.Routing.RiskRanking = r.Bool("risk_ranking", c.Routing.RiskRanking)
@@ -386,6 +471,23 @@ func validate(c *Config) error {
 			}
 		}
 	}
+	for _, f := range c.GBFS {
+		if seen["gbfs:"+f.Name] {
+			return fmt.Errorf("config: duplicate GBFS feed name %q", f.Name)
+		}
+		seen["gbfs:"+f.Name] = true
+		if strings.HasPrefix(f.URL, "http://") && !f.AllowInsecure {
+			return fmt.Errorf("config: GBFS feed %q uses plain http; set allow_insecure = true to accept it", f.Name)
+		}
+		if IsLocal(f.URL) {
+			if _, err := os.Stat(LocalPath(f.URL)); err != nil {
+				return fmt.Errorf("config: GBFS feed %q: local discovery file not found: %s", f.Name, LocalPath(f.URL))
+			}
+		}
+		if f.Poll <= 0 || f.MaxAge <= 0 {
+			return fmt.Errorf("config: GBFS feed %q poll and max_age must be positive", f.Name)
+		}
+	}
 	if strings.HasPrefix(c.OSM.URL, "http://") && !c.OSM.AllowInsecure {
 		return fmt.Errorf("config: [osm] url uses plain http; set allow_insecure = true to accept it")
 	}
@@ -397,7 +499,7 @@ func validate(c *Config) error {
 	if h := c.Routing.CarHeuristic; h != "fast" && h != "exact" {
 		return fmt.Errorf("config: routing.car_heuristic must be \"fast\" or \"exact\", got %q", h)
 	}
-	if c.Routing.WalkSpeedKmh <= 0 || c.Routing.BikeSpeedKmh <= 0 {
+	if c.Routing.WalkSpeedKmh <= 0 || c.Routing.BikeSpeedKmh <= 0 || c.Routing.ScooterSpeedKmh <= 0 {
 		return fmt.Errorf("config: speeds must be positive")
 	}
 	if c.Routing.MaxTransfers < 0 || c.Routing.MaxTransfers > 8 {
@@ -405,6 +507,13 @@ func validate(c *Config) error {
 	}
 	if c.Routing.RailEntryBuffer < 0 || c.Routing.RailTransferBuffer < 0 {
 		return fmt.Errorf("config: rail entry and transfer buffers cannot be negative")
+	}
+	if c.Routing.SharedPickupWalk < 0 || c.Routing.SharedDropoffWalk < 0 ||
+		c.Routing.SharedUnlock < 0 || c.Routing.SharedPark < 0 || c.Routing.SharedCandidates < 1 {
+		return fmt.Errorf("config: shared mobility durations must be non-negative and shared_candidates positive")
+	}
+	if c.Routing.BatteryReserveRatio < 0 || c.Routing.BatteryReserveM < 0 {
+		return fmt.Errorf("config: battery reserve margins cannot be negative")
 	}
 	return nil
 }

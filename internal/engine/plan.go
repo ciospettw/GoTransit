@@ -5,6 +5,7 @@ import (
 	"sort"
 	"time"
 
+	"gotransit/internal/gbfs"
 	"gotransit/internal/geo"
 	"gotransit/internal/graph"
 	"gotransit/internal/transit"
@@ -19,6 +20,9 @@ type Request struct {
 	ArriveBy         bool
 	Num              int
 	Live             bool // also return the strictly RT-covered subset
+	// SharedVehicle selects the GBFS class for multimodal requests:
+	// bicycle (default), scooter, or any.
+	SharedVehicle string
 }
 
 // Response is the itinerary set.
@@ -89,7 +93,7 @@ type Step struct {
 }
 
 type Leg struct {
-	Mode      string     `json:"mode"` // walk | bike | car | transit
+	Mode      string     `json:"mode"` // walk | bike | scooter | car | transit
 	From      Place      `json:"from"`
 	To        Place      `json:"to"`
 	Depart    time.Time  `json:"depart"`
@@ -108,7 +112,8 @@ type Leg struct {
 	// BoardReadyAt is internal tracking metadata. It is populated when an
 	// onboard replan starts directly at a rail transfer, whose incoming-arrival
 	// anchor would otherwise be absent from the returned itinerary.
-	BoardReadyAt time.Time `json:"-"`
+	BoardReadyAt time.Time        `json:"-"`
+	Rental       *gbfs.Assignment `json:"rental,omitempty"`
 
 	// Transit legs only: probability the rider makes THIS boarding given the
 	// connection slack and the delay distributions (risk.go). RiskLevel is
@@ -136,11 +141,39 @@ func (e *Engine) Plan(req Request) (*Response, error) {
 			return nil, err
 		}
 		return &Response{Itineraries: []Itinerary{*it}}, nil
-	case "transit", "", "bike_transit", "bike+transit":
-		bike := req.Mode == "bike_transit" || req.Mode == "bike+transit"
-		return e.planTransit(req, fromLat, fromLon, toLat, toLon, bike)
+	case "transit", "":
+		req.SharedVehicle = ""
+		return e.planTransit(req, fromLat, fromLon, toLat, toLon, false, "")
+	case "bike_transit", "bike+transit":
+		if req.SharedVehicle == "" {
+			req.SharedVehicle = "bicycle"
+		}
+		class := gbfs.ParseClass(req.SharedVehicle)
+		if class != gbfs.ClassBicycle && class != gbfs.ClassScooter && class != gbfs.ClassAny {
+			return nil, fmt.Errorf("unknown shared vehicle class %q (use bicycle, scooter, or any)", req.SharedVehicle)
+		}
+		return e.planTransit(req, fromLat, fromLon, toLat, toLon, true, class)
+	case "scooter_transit", "scooter+transit", "shared_transit":
+		if !e.SharedConfigured && e.GBFS == nil {
+			return nil, fmt.Errorf("mode %q requires at least one [[gbfs]] feed", req.Mode)
+		}
+		if req.SharedVehicle == "" {
+			if req.Mode == "shared_transit" {
+				req.SharedVehicle = "any"
+			} else {
+				req.SharedVehicle = "scooter"
+			}
+		}
+		class := gbfs.ParseClass(req.SharedVehicle)
+		if class != gbfs.ClassBicycle && class != gbfs.ClassScooter && class != gbfs.ClassAny {
+			return nil, fmt.Errorf("unknown shared vehicle class %q (use bicycle, scooter, or any)", req.SharedVehicle)
+		}
+		return e.planTransit(req, fromLat, fromLon, toLat, toLon, true, class)
+	case "personal_bike_transit":
+		req.SharedVehicle = ""
+		return e.planTransit(req, fromLat, fromLon, toLat, toLon, true, "")
 	default:
-		return nil, fmt.Errorf("unknown mode %q (use transit, bike_transit, bike, car, walk)", req.Mode)
+		return nil, fmt.Errorf("unknown mode %q (use transit, bike_transit, scooter_transit, personal_bike_transit, bike, car, walk)", req.Mode)
 	}
 }
 
@@ -159,8 +192,12 @@ func (e *Engine) planRoad(mode string, fLat, fLon, tLat, tLon int32, when time.T
 		if e.Cfg.Routing.CarHeuristic == "exact" {
 			eps = 1.0
 		}
-	case "bike":
-		m, sf = graph.ModeBike, graph.SpeedFactor(e.Cfg.Routing.BikeSpeedKmh)
+	case "bike", "scooter":
+		speed := e.Cfg.Routing.BikeSpeedKmh
+		if mode == "scooter" {
+			speed = e.Cfg.Routing.ScooterSpeedKmh
+		}
+		m, sf = graph.ModeBike, graph.SpeedFactor(speed)
 		eps = 1.1
 	default:
 		m, sf = graph.ModeFoot, graph.SpeedFactor(e.Cfg.Routing.WalkSpeedKmh)
@@ -268,14 +305,22 @@ type accessSet struct {
 	mode         string
 	priorRailArr map[int32]uint32 // actual incoming-rail arrival by source stop
 	absolute     bool             // sec values are already seconds since midnight
+	shared       map[int32]sharedPlan
 }
 
-func (e *Engine) planTransit(req Request, fLat, fLon, tLat, tLon int32, bikeAllowed bool) (*Response, error) {
+func (e *Engine) planTransit(req Request, fLat, fLon, tLat, tLon int32, bikeAllowed bool, sharedClass gbfs.Class) (*Response, error) {
 	gb, tb := e.GraphBundle(), e.TTBundle()
 	r := e.Cfg.Routing
+	useShared := sharedClass != "" && (e.SharedConfigured || e.GBFS != nil)
 
 	sfWalk := graph.SpeedFactor(r.WalkSpeedKmh)
-	sfBike := graph.SpeedFactor(r.BikeSpeedKmh)
+	rideSpeed := r.BikeSpeedKmh
+	if sharedClass == gbfs.ClassScooter {
+		rideSpeed = r.ScooterSpeedKmh
+	} else if sharedClass == gbfs.ClassAny && r.ScooterSpeedKmh > rideSpeed {
+		rideSpeed = r.ScooterSpeedKmh
+	}
+	sfBike := graph.SpeedFactor(rideSpeed)
 
 	// access/egress walking sets (always)
 	walkAcc := e.reachStops(gb, tb, fLat, fLon, graph.ModeFoot, sfWalk, uint32(r.MaxWalkAccess.Seconds()*10), "walk")
@@ -287,14 +332,23 @@ func (e *Engine) planTransit(req Request, fLat, fLon, tLat, tLon int32, bikeAllo
 		return nil, fmt.Errorf("no stops reachable on foot around the destination (max %s)", r.MaxWalkAccess)
 	}
 
+	when := req.When
 	var bikeAcc, bikeEgr *accessSet
 	if bikeAllowed {
 		ba := e.reachStops(gb, tb, fLat, fLon, graph.ModeBike, sfBike, uint32(r.MaxBikeAccess.Seconds()*10), "bike")
 		be := e.reachStops(gb, tb, tLat, tLon, graph.ModeBike, sfBike, uint32(r.MaxBikeAccess.Seconds()*10), "bike")
+		if useShared {
+			if e.GBFS != nil {
+				ba = e.sharedAccessSet(gb, tb, ba, fLat, fLon, true, sharedClass, whenOrNow(req.When))
+				be = e.sharedAccessSet(gb, tb, be, tLat, tLon, false, sharedClass, whenOrNow(req.When))
+			} else {
+				ba = accessSet{sec: map[int32]uint32{}, anchor: map[int32]int32{}, mode: "shared", shared: map[int32]sharedPlan{}}
+				be = accessSet{sec: map[int32]uint32{}, anchor: map[int32]int32{}, mode: "shared", shared: map[int32]sharedPlan{}}
+			}
+		}
 		bikeAcc, bikeEgr = &ba, &be
 	}
 
-	when := req.When
 	if req.ArriveBy {
 		return e.planTransitArriveBy(req, fLat, fLon, tLat, tLon, walkAcc, walkEgr, bikeAcc, bikeEgr)
 	}
@@ -341,15 +395,18 @@ func (e *Engine) planTransit(req Request, fLat, fLon, tLat, tLon int32, bikeAllo
 		}
 	}
 
-	// bike+transit also offers the honest comparison: just ride the bike
+	// Multimodal planning always includes the honest direct-ride comparison.
+	// With GBFS this is another checked rental, never an imaginary personal bike.
 	if bikeAllowed {
-		if direct, err := e.planRoad("bike", fLat, fLon, tLat, tLon, when, false); err == nil {
-			directDur := time.Duration(direct.DurationS) * time.Second
-			include := directDur <= 45*time.Minute
-			if !walkBestArr.IsZero() && direct.Arrive.After(walkBestArr.Add(10*time.Minute)) {
-				include = false
+		if useShared {
+			if e.GBFS != nil { // nil while GBFS boots: walk/transit remains
+				if direct, ok := e.planSharedDirect(fLat, fLon, tLat, tLon, when, sharedClass); ok &&
+					(walkBestArr.IsZero() || !direct.Arrive.After(walkBestArr.Add(10*time.Minute))) {
+					all = append(all, direct)
+				}
 			}
-			if include {
+		} else if direct, err := e.planRoad("bike", fLat, fLon, tLat, tLon, when, false); err == nil {
+			if direct.DurationS <= 45*60 && (walkBestArr.IsZero() || !direct.Arrive.After(walkBestArr.Add(10*time.Minute))) {
 				all = append(all, *direct)
 			}
 		}
@@ -383,11 +440,19 @@ func (e *Engine) planTransitArriveBy(req Request, fLat, fLon, tLat, tLon int32, 
 	deadline := req.When
 
 	arrivalFor := func(dep time.Time) (time.Time, bool) {
-		its := e.runRaptor(gb, tb, req, dep, fLat, fLon, tLat, tLon, &walkAcc, &walkEgr)
 		var best time.Time
-		for _, it := range its {
-			if best.IsZero() || it.Arrive.Before(best) {
-				best = it.Arrive
+		variants := [][2]*accessSet{{&walkAcc, &walkEgr}}
+		if bikeAcc != nil && bikeEgr != nil {
+			variants = append(variants, [2]*accessSet{bikeAcc, &walkEgr}, [2]*accessSet{&walkAcc, bikeEgr})
+		}
+		for _, variant := range variants {
+			if len(variant[0].sec) == 0 || len(variant[1].sec) == 0 {
+				continue
+			}
+			for _, it := range e.runRaptor(gb, tb, req, dep, fLat, fLon, tLat, tLon, variant[0], variant[1]) {
+				if best.IsZero() || it.Arrive.Before(best) {
+					best = it.Arrive
+				}
 			}
 		}
 		return best, !best.IsZero()
@@ -422,7 +487,11 @@ func (e *Engine) planTransitArriveBy(req Request, fLat, fLon, tLat, tLon int32, 
 	req2 := req
 	req2.ArriveBy = false
 	req2.When = lo
-	resp, err := e.planTransit(req2, fLat, fLon, tLat, tLon, bikeAcc != nil)
+	sharedClass := gbfs.Class("")
+	if (e.GBFS != nil || e.SharedConfigured) && req.SharedVehicle != "" {
+		sharedClass = gbfs.ParseClass(req.SharedVehicle)
+	}
+	resp, err := e.planTransit(req2, fLat, fLon, tLat, tLon, bikeAcc != nil, sharedClass)
 	if err != nil {
 		return nil, err
 	}

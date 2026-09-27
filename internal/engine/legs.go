@@ -51,21 +51,34 @@ func (e *Engine) assemble(gb *GraphBundle, tb *TTBundle, j transit.Journey, base
 		return Itinerary{}, false
 	}
 	if acc.mode != "none" { // "none": journey starts at the stop (onboard replans)
-		accessArr := base.Add(time.Duration(depSec+accSec) * time.Second)
-		accessLeg := e.stopStreetLeg(gb, tb, acc.mode, fLat, fLon, boardStop, false)
-		accessLeg.Depart = base.Add(time.Duration(depSec) * time.Second)
-		accessLeg.Arrive = accessArr
-		accessLeg.DurationS = int(accSec)
-		accessLeg.From = Place{Lat: e7f(fLat), Lon: e7f(fLon)}
-		accessLeg.To = stopPlace(tt, boardStop)
-		reconcileLegSteps(&accessLeg)
-		legs = append(legs, accessLeg)
+		if plan, shared := acc.shared[sourceStop]; shared {
+			sharedLegs, ok := e.sharedLegs(plan, fLat, fLon, tt.StopLat[sourceStop], tt.StopLon[sourceStop],
+				base.Add(time.Duration(depSec)*time.Second))
+			if !ok {
+				return Itinerary{}, false
+			}
+			legs = append(legs, sharedLegs...)
+			sig += "s" + rentalSignature(plan.Assignment) + "."
+		} else {
+			accessArr := base.Add(time.Duration(depSec+accSec) * time.Second)
+			accessLeg := e.stopStreetLeg(gb, tb, acc.mode, fLat, fLon, sourceStop, false)
+			accessLeg.Depart = base.Add(time.Duration(depSec) * time.Second)
+			accessLeg.Arrive = accessArr
+			accessLeg.DurationS = int(accSec)
+			accessLeg.From = Place{Lat: e7f(fLat), Lon: e7f(fLon)}
+			accessLeg.To = stopPlace(tt, sourceStop)
+			reconcileLegSteps(&accessLeg)
+			legs = append(legs, accessLeg)
+		}
 	}
 
 	// --- rides and transfers ---
 	for _, l := range j.Legs {
 		if l.Ride {
 			leg := e.transitLeg(tt, l, base)
+			if len(legs) > 0 && legs[len(legs)-1].Arrive.After(leg.Depart) {
+				return Itinerary{}, false // exact shared access no longer catches this ride
+			}
 			if len(legs) == firstRide && !initialRailReady.IsZero() && leg.Route != nil &&
 				transit.IsRailLikeRouteType(leg.Route.Type) {
 				leg.BoardReadyAt = initialRailReady
@@ -105,15 +118,24 @@ func (e *Engine) assemble(gb *GraphBundle, tb *TTBundle, j transit.Journey, base
 	if !okE {
 		return Itinerary{}, false
 	}
-	egressLeg := e.stopStreetLeg(gb, tb, egr.mode, tLat, tLon, j.Target, true)
 	lastArr := legs[len(legs)-1].Arrive
-	egressLeg.Depart = lastArr
-	egressLeg.Arrive = lastArr.Add(time.Duration(egrSec) * time.Second)
-	egressLeg.DurationS = int(egrSec)
-	egressLeg.From = stopPlace(tt, j.Target)
-	egressLeg.To = Place{Lat: e7f(tLat), Lon: e7f(tLon)}
-	reconcileLegSteps(&egressLeg)
-	legs = append(legs, egressLeg)
+	if plan, shared := egr.shared[j.Target]; shared {
+		sharedLegs, ok := e.sharedLegs(plan, tt.StopLat[j.Target], tt.StopLon[j.Target], tLat, tLon, lastArr)
+		if !ok {
+			return Itinerary{}, false
+		}
+		legs = append(legs, sharedLegs...)
+		sig += "s" + rentalSignature(plan.Assignment) + "."
+	} else {
+		egressLeg := e.stopStreetLeg(gb, tb, egr.mode, tLat, tLon, j.Target, true)
+		egressLeg.Depart = lastArr
+		egressLeg.Arrive = lastArr.Add(time.Duration(egrSec) * time.Second)
+		egressLeg.DurationS = int(egrSec)
+		egressLeg.From = stopPlace(tt, j.Target)
+		egressLeg.To = Place{Lat: e7f(tLat), Lon: e7f(tLon)}
+		reconcileLegSteps(&egressLeg)
+		legs = append(legs, egressLeg)
+	}
 
 	it := Itinerary{
 		Depart:    legs[0].Depart,

@@ -49,9 +49,13 @@ files. GoTransit is the opposite bet, taken seriously:
   names. Deliberately **no contraction hierarchies**: preprocessing would die
   on every live OSM diff. Plain A\* on live arrays does Roma→Firenze (275 km,
   68 instructions) in ~30 ms core.
-- **🚲+🚌 bike+transit that behaves** — bike legs only when they beat the
-  walking plan by ≥5 min (configurable), capped at 18 min, with the honest
-  "just ride the whole way" comparison included. No 1-hour bike legs, ever.
+- **🚲+🚌 GBFS-aware bike+transit** — with `[[gbfs]]`, a bike leg means a real
+  currently rentable bike: walk to it, unlock, ride, return where legal, walk
+  on. Station pools, dockless vehicles, e-bikes and scooters stay distinct;
+  battery range, return capacity and geofences are checked before routing.
+  `personal_bike_transit` keeps explicit bring-your-own-bike behavior;
+  `bike_transit` falls back to that legacy behavior only when no GBFS source
+  is configured.
 - **🕐 Timezone-proof** — every query and answer speaks the network's GTFS
   timezone, whatever the client or host think their clock is.
 - **🛂 Coverage guard** — trips whose shapes/stops leave the imported extract
@@ -88,8 +92,8 @@ Sequential, client-friendly events:
 | `vehicle` | 🚌 where your bus **is** — position, the stop it's approaching, `stops_away` from you, its delay — even while you're still walking |
 | `delay` | refreshed per-leg times whenever anything moves ≥30 s |
 | `progress` | boarding confirmed / alighted; rail fallback adds `tracking_source: "schedule_assumed"` |
-| `warning` | `no_rt_signal`, `possibly_cancelled`, or one-shot `position_unavailable` before schedule-assumed rail tracking |
-| `reroute` | a full replacement itinerary + `changed_legs` + reason: `better_arrival` (≥5 min gained, never flip-flops), `cancelled`, `missed_connection` (yes, also the bus that came *early*), `stop_skipped` |
+| `warning` | `no_rt_signal`, `possibly_cancelled`, `shared_vehicle_unavailable`, or one-shot `position_unavailable` before schedule-assumed rail tracking |
+| `reroute` | a full replacement itinerary + `changed_legs` + reason: `better_arrival`, `cancelled`, `missed_connection`, `stop_skipped`, `shared_vehicle_unavailable` |
 | `arrived` | 🎉 |
 
 **A broken plan is always replaced.** Missed connection, cancellation,
@@ -100,6 +104,15 @@ retrying until an alternative exists. The whole loop is covered by a
 wall-clock E2E test driving a fake evolving RT feed through
 delay → better-arrival reroute → cancellation reroute → vehicle-confirmed
 boarding → early arrival.
+
+The same loop watches every future GBFS rental while the user walks, waits or
+rides transit. If the assigned vehicle is taken, its station empties, its
+battery falls below the routed distance plus reserve, the return dock fills,
+or the feed goes stale, GoTransit replans the **whole** remaining journey. From
+an occupied bus it seeds every safe downstream stop, so getting off earlier or
+later, using another shared vehicle, changing service, staying on, and going
+transit-only all compete by expected arrival. A slower replacement bike never
+wins merely because the original itinerary contained a bike.
 
 ## 📊 Measured (Apple M-series, 8 GB)
 
@@ -124,7 +137,10 @@ Plain JSON over GET — React Native `fetch`, curl, whatever. CORS open.
 
 ```
 GET /v1/plan?from=41.9009,12.5013&to=41.8385,12.4675
-             &mode=transit          transit | bike_transit | bike | car | walk
+             &mode=transit          transit | bike_transit | scooter_transit |
+                                    shared_transit | personal_bike_transit |
+                                    bike | car | walk
+             &vehicle=bicycle       bicycle | scooter | any (shared modes)
              &depart=now            RFC3339, "YYYY-MM-DD HH:MM" (network tz), or arrive=…
              &live=1&num=3
 GET /v1/track?itinerary=<id>        WebSocket journey tracking
@@ -151,11 +167,34 @@ name = "roma"
 url  = "https://romamobilita.it/sites/default/files/rome_static_gtfs.zip"
 rt_trip_updates      = "https://romamobilita.it/sites/default/files/rome_rtgtfs_trip_updates_feed.pb"
 rt_vehicle_positions = "https://romamobilita.it/sites/default/files/rome_rtgtfs_vehicle_positions_feed.pb"
+
+[[gbfs]]
+name = "city-bikes"
+url  = "https://operator.example/gbfs.json"
+poll = "20s"
+max_age = "5m"
 ```
 
 Everything else has defaults — polling (GTFS every minute via ETag), speeds,
 transfer slack, live thresholds, reroute hysteresis. `gotransit init` writes
 them all, commented.
+
+### GBFS behavior
+
+GoTransit consumes [GBFS](https://github.com/MobilityData/gbfs) auto-discovery
+across 1.x, 2.x and 3.x, including
+`station_information`, `station_status`, `free_bike_status`/`vehicle_status`,
+`vehicle_types` and `geofencing_zones`. Sparse legacy feeds default to a human
+bicycle as required by GBFS; richer feeds retain form factor and propulsion.
+Motorized vehicles are only promised when a per-vehicle
+`current_range_meters` is available (or can be derived from a reported battery
+percentage and `max_range_meters`). Aggregate e-bike counts without battery
+data are deliberately not guessed.
+
+Each rental leg includes a `rental` object with provider, vehicle/type or
+station-pool identifiers, pickup/return coordinates, rental deep links,
+propulsion, battery/range, return constraint and routed required range. Status
+and freshness are visible under `shared_mobility` in `/v1/status`.
 
 ## 🧪 Tests
 

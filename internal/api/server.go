@@ -197,7 +197,8 @@ func (s *Server) handlePlan(w http.ResponseWriter, r *http.Request) {
 	req := engine.Request{
 		FromLat: fromLat, FromLon: fromLon,
 		ToLat: toLat, ToLon: toLon,
-		Mode: strings.ToLower(q.Get("mode")),
+		Mode:          strings.ToLower(q.Get("mode")),
+		SharedVehicle: strings.ToLower(q.Get("vehicle")),
 	}
 	if req.Mode == "" {
 		req.Mode = "transit"

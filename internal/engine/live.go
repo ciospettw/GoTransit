@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"time"
 
+	"gotransit/internal/gbfs"
 	"gotransit/internal/graph"
 	"gotransit/internal/transit"
 )
@@ -105,6 +106,11 @@ type StopPlanSource struct {
 	// Onboard retains the actual incoming ride, including geometry and arrival
 	// uncertainty. Seeds must be reachable downstream stops of this trip.
 	Onboard *Leg
+	// Mode/SharedVehicle keep bike/scooter+transit active during a live
+	// replan from downstream stops. The transit-only variant is still run and
+	// competes normally by expected arrival.
+	Mode          string
+	SharedVehicle string
 }
 
 // PlanFromStops runs a transit plan whose sources are stops with known
@@ -150,28 +156,56 @@ func (e *Engine) PlanFromStops(seeds map[int32]time.Time, tLatF, tLonF float64, 
 	if len(acc.sec) == 0 {
 		return nil, fmt.Errorf("no usable seeds")
 	}
-	egr := e.reachStops(gb, tb, tLat, tLon, graph.ModeFoot,
+	walkEgr := e.reachStops(gb, tb, tLat, tLon, graph.ModeFoot,
 		graph.SpeedFactor(e.Cfg.Routing.WalkSpeedKmh),
 		uint32(e.Cfg.Routing.MaxWalkAccess.Seconds()*10), "walk")
-	if len(egr.sec) == 0 {
+	if len(walkEgr.sec) == 0 && source.SharedVehicle == "" {
 		return nil, fmt.Errorf("no stops reachable around the destination")
 	}
-	req := Request{ToLat: tLatF, ToLon: tLonF, Mode: "transit", When: when, Num: num}
-	its := e.runRaptor(gb, tb, req, when, 0, 0, tLat, tLon, &acc, &egr)
+	reqMode := source.Mode
+	if reqMode == "" {
+		reqMode = "transit"
+	}
+	req := Request{ToLat: tLatF, ToLon: tLonF, Mode: reqMode, SharedVehicle: source.SharedVehicle, When: when, Num: num}
+	its := e.runRaptor(gb, tb, req, when, 0, 0, tLat, tLon, &acc, &walkEgr)
+	var sharedEgr accessSet
+	if e.GBFS != nil && source.SharedVehicle != "" {
+		class := gbfs.ParseClass(source.SharedVehicle)
+		speed := e.Cfg.Routing.BikeSpeedKmh
+		if class == gbfs.ClassScooter {
+			speed = e.Cfg.Routing.ScooterSpeedKmh
+		} else if class == gbfs.ClassAny && e.Cfg.Routing.ScooterSpeedKmh > speed {
+			speed = e.Cfg.Routing.ScooterSpeedKmh
+		}
+		baseEgr := e.reachStops(gb, tb, tLat, tLon, graph.ModeBike,
+			graph.SpeedFactor(speed), uint32(e.Cfg.Routing.MaxBikeAccess.Seconds()*10), "bike")
+		sharedEgr = e.sharedAccessSet(gb, tb, baseEgr, tLat, tLon, false, class, when)
+		if len(sharedEgr.sec) > 0 {
+			its = append(its, e.runRaptor(gb, tb, req, when, 0, 0, tLat, tLon, &acc, &sharedEgr)...)
+		}
+	}
 	if source.Onboard != nil {
 		// Walking is only possible AFTER alighting at a supplied future stop.
 		// RAPTOR requires a ride and therefore cannot return these tails itself.
 		for stop, at := range seeds {
-			sec, ok := egr.sec[stop]
-			if !ok {
-				continue
+			if sec, ok := walkEgr.sec[stop]; ok {
+				leg := e.stopStreetLeg(gb, tb, "walk", tLat, tLon, stop, true)
+				leg.From, leg.To = stopPlace(tt, stop), Place{Lat: tLatF, Lon: tLonF}
+				leg.Depart, leg.Arrive = at, at.Add(time.Duration(sec)*time.Second)
+				leg.DurationS = int(sec)
+				reconcileLegSteps(&leg)
+				its = append(its, Itinerary{Legs: []Leg{leg}, Arrive: leg.Arrive})
 			}
-			leg := e.stopStreetLeg(gb, tb, "walk", tLat, tLon, stop, true)
-			leg.From, leg.To = stopPlace(tt, stop), Place{Lat: tLatF, Lon: tLonF}
-			leg.Depart, leg.Arrive = at, at.Add(time.Duration(sec)*time.Second)
-			leg.DurationS = int(sec)
-			reconcileLegSteps(&leg)
-			its = append(its, Itinerary{Legs: []Leg{leg}, Arrive: leg.Arrive})
+			if plan, ok := sharedEgr.shared[stop]; ok {
+				legs, valid := e.sharedLegs(plan, tt.StopLat[stop], tt.StopLon[stop], tLat, tLon, at)
+				if valid && len(legs) > 0 {
+					// retainOnboard uses this private stop anchor to prove that the
+					// tail begins at a downstream stop of the vehicle already ridden.
+					legs[0].From.StopID = tt.StopID[stop]
+					its = append(its, Itinerary{Legs: legs, Depart: legs[0].Depart,
+						Arrive: legs[len(legs)-1].Arrive, sig: "onboard-shared|" + rentalSignature(plan.Assignment)})
+				}
+			}
 		}
 		retained := its[:0]
 		for _, it := range its {
