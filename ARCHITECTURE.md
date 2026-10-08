@@ -18,7 +18,7 @@ internal/gtfs        zip + RFC-4180 CSV (parallel fast path), feed model
 internal/transit     timetable compile, transfers on the street net, RAPTOR
 internal/engine      atomic snapshots (graph/timetable bundles + search pools), planner
 internal/api         HTTP JSON + embedded map debug UI (/)
-internal/updater     GTFS conditional-GET poller, Geofabrik osc poller (all in-RAM)
+internal/updater     GTFS conditional-GET poller, Geofabrik osc poller, source tiering
 ```
 
 Data flows one way: `osm/gtfs → graph/transit (immutable snapshots) → engine
@@ -58,10 +58,13 @@ swap a pointer; readers never lock.
 centro Italia: 380 MB PBF → 1.78 M nodes, 4.44 M directed edges, 44 MB
 geometry blob, ~8 s cold.
 
-**Source store** (92 MB blob): ways+refs+ids+coords+names, varint delta
-encoded, flate(1). It lives **in RAM** — the temp PBF is deleted right after
-parsing and the engine never writes a file. Live diffs decode this blob,
-fold changes in, re-encode. Local PBFs are read in place and never touched.
+**Source store** (92 MB for the benchmark): ways+refs+ids+coords+names,
+varint delta encoded, flate(1). Without `[cache]` an updateable source lives in
+RAM and the temporary PBF is deleted. With `[cache]` it is streamed to a
+compact file, the larger remote PBF is removed, and neither the source nor
+remote GTFS ZIPs occupy the steady-state heap. Live diffs load, update and
+atomically replace it. Sources without supported live updates retain only the
+revalidatable PBF. Local PBFs are read in place and never deleted.
 
 **Searches** — all allocation-free on pooled, epoch-stamped state:
 
@@ -109,9 +112,9 @@ Roma+COTRAL: 20 946 stops, 3 742 patterns, 242 928 trips, 7.45 M stop_times,
 
 ## Planner (`internal/engine`)
 
-`GraphBundle`/`TTBundle` pair each snapshot with `sync.Pool`s of search state
-sized for it, behind `atomic.Pointer`s. A query pins both bundles once; a
-swap mid-query is invisible.
+`GraphBundle`/`TTBundle` pair each snapshot with byte-budgeted search-state
+pools sized for it, behind `atomic.Pointer`s. A query pins both bundles once;
+a swap mid-query is invisible.
 
 Transit planning: snap origin/destination → bounded street searches produce
 stop seed sets (walk always; bike variants for `bike_transit` capped at
@@ -132,22 +135,35 @@ forward plan filtered to the deadline.
 
 - **GTFS loop** (per feed, default every minute): ETag/`If-Modified-Since`
   conditional GET + SHA-256 guard (servers that ignore conditionals get a
-  one-time warning). Remote zips live in RAM; local feeds are stat'ed and
-  reloaded when their mtime changes. On change: re-parse all feeds, recompile
+  one-time warning). Remote ZIPs are file-backed when `[cache]` is configured;
+  local feeds are stat'ed and reloaded when their mtime changes. On change:
+  re-parse all feeds, recompile
   the timetable against the *current* graph, swap. The street graph is
   untouched, ever.
 - **OSM loop** (Geofabrik only): the extract's replication sequence and diff
   URL come from the PBF header itself (so a *local* Geofabrik extract updates
   too). Poll `state.txt`; for each pending daily `.osc.gz`: parse
-  (create/modify/delete of nodes/ways), fold into the in-RAM source blob
+  (create/modify/delete of nodes/ways), fold into the compact source image
   (`ApplyChange` → fresh `SrcData`, old one untouched for safety),
   reassemble, swap, re-encode the blob, then recompile the timetable (stop
   snaps/transfers reference graph node ids). Measured with a real diff:
   ~5 s total. Non-Geofabrik sources get a loud startup warning: no live
   updates.
 
-All state (etags, hashes, replication seq) is in memory: a restart simply
-re-downloads and rebuilds — download, parse, destroy, poll.
+Validators and the replication sequence travel with the optional cache. A
+warm restart assembles directly from the compact source image, then catches up
+with Geofabrik diffs. Ephemeral mode still downloads, parses and destroys.
+
+## Adaptive memory control
+
+Every 30 seconds the controller observes the live heap, allocation velocity,
+recent GC CPU share, cgroup/GOMEMLIMIT ceiling and host pressure. It adjusts
+GOGC gradually inside bounded safety limits unless the operator explicitly set
+`GOGC`, sizes idle query caches by their actual retained bytes, and returns
+pages only when their expected reuse is slower than the benefit of releasing
+them. The cooldown derives from measured release duration and targets at most
+0.1% background wall time. Under pressure it drops idle caches and shortens
+the cooldown.
 
 ## GTFS-Realtime (`internal/rt`, `internal/track`)
 

@@ -24,10 +24,10 @@ const exampleConfig = `# gotransit.toml — the whole configuration. Anything om
 listen   = ":8080"
 # debug_ui = false     # map debug interface at / (default: on)
 
-# [cache]              # optional on-disk cache of remote sources: a warm
-# dir = "/var/cache/gotransit"   # restart revalidates (ETag/Last-Modified)
-                       # and reuses unchanged OSM/GTFS instead of
-                       # re-downloading. Default: off, fully ephemeral.
+# [cache]              # optional persistent source tier: GTFS ZIPs stay
+# dir = "/var/cache/gotransit"   # file-backed and the initial OSM PBF becomes
+                       # a smaller restart/update image. Default: off,
+                       # fully ephemeral.
 
 [osm]
 # Geofabrik is the supported OSM host: its -updates/ osmChange stream keeps

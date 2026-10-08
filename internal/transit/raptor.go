@@ -104,6 +104,33 @@ func NewRaptor(tt *Timetable) *Raptor {
 	return r
 }
 
+// MemoryBytes reports the reusable backing arrays currently retained by this
+// query state. The number of RAPTOR rounds grows lazily with actual requests.
+func (r *Raptor) MemoryBytes() uint64 {
+	total := uint64(cap(r.tauBest))*4 + uint64(cap(r.marked)) +
+		uint64(cap(r.markList))*4 + uint64(cap(r.patMin))*4 + uint64(cap(r.patList))*4 +
+		uint64(cap(r.sourceRail)) + uint64(cap(r.sourceRailArr))*4
+	for _, values := range r.tau {
+		total += uint64(cap(values)) * 4
+	}
+	for _, values := range r.kind {
+		total += uint64(cap(values))
+	}
+	for _, values := range r.ptrip {
+		total += uint64(cap(values)) * 4
+	}
+	for _, values := range r.pboard {
+		total += uint64(cap(values)) * 2
+	}
+	for _, values := range r.pfrom {
+		total += uint64(cap(values)) * 4
+	}
+	for _, values := range r.pday {
+		total += uint64(cap(values)) * 4
+	}
+	return total
+}
+
 func (r *Raptor) round(k int) {
 	for len(r.tau) <= k {
 		n := r.tt.NumStops()

@@ -14,6 +14,7 @@ import (
 	"gotransit/internal/engine"
 	"gotransit/internal/graph"
 	"gotransit/internal/gtfs"
+	"gotransit/internal/memrelease"
 	"gotransit/internal/osm"
 	"gotransit/internal/transit"
 )
@@ -24,6 +25,7 @@ type feedData struct {
 
 	// remote feeds
 	zip     []byte
+	path    string
 	etag    string
 	lastMod string
 	sha     string
@@ -33,9 +35,11 @@ type feedData struct {
 	mtime time.Time
 }
 
-// Updater owns the live data: the compressed graph source blob and the feed
-// zips, all in RAM. Nothing here ever touches the disk (local sources are
-// read in place and never modified).
+const graphSourceCache = "graph-source.gts"
+
+// Updater owns live source data. With [cache], immutable source payloads are
+// file-backed and loaded only for rebuilds; ephemeral deployments retain them
+// in RAM and preserve the original zero-disk behavior.
 type Updater struct {
 	E   *engine.Engine
 	Cfg *config.Config
@@ -48,6 +52,7 @@ type Updater struct {
 
 	mu      sync.Mutex
 	srcBlob []byte
+	srcPath string
 	feeds   map[string]*feedData
 
 	rebuildMu chan struct{}
@@ -67,19 +72,92 @@ func New(e *engine.Engine, cfg *config.Config, log *slog.Logger) *Updater {
 	return u
 }
 
-// SetGraphSource installs the compressed graph source blob (boot and after
-// each osc application).
-func (u *Updater) SetGraphSource(blob []byte) {
+// LoadCachedGraphSource installs and decodes a source image when it belongs to
+// the configured OSM URL. Corrupt or old images are discarded and rebuilt.
+func (u *Updater) LoadCachedGraphSource() (*graph.SrcData, bool) {
+	if _, ok := u.cache.Meta(graphSourceCache, u.Cfg.OSM.URL); !ok {
+		return nil, false
+	}
+	path, ok := u.cache.FilePath(graphSourceCache)
+	if !ok {
+		return nil, false
+	}
+	src, err := graph.LoadStore(path)
+	if err != nil {
+		if u.Log != nil {
+			u.Log.Warn("cached graph source is invalid; rebuilding from PBF", "err", err)
+		}
+		u.cache.Remove(graphSourceCache)
+		return nil, false
+	}
 	u.mu.Lock()
-	u.srcBlob = blob
+	u.srcPath, u.srcBlob = path, nil
 	u.mu.Unlock()
+	return src, true
+}
+
+// DiscardCachedGraphSource removes a derived source that cannot participate in
+// the supported live-update path. Its original PBF can then be revalidated.
+func (u *Updater) DiscardCachedGraphSource() {
+	u.mu.Lock()
+	u.srcPath, u.srcBlob = "", nil
+	u.mu.Unlock()
+	u.cache.Remove(graphSourceCache)
+}
+
+// SetGraphSource persists the compact update/restart image when cache is
+// available. On disk failure it falls back to the in-memory representation.
+func (u *Updater) SetGraphSource(src *graph.SrcData) (bool, error) {
+	if u.cache.Enabled() {
+		path, err := u.cache.StoreGenerated(graphSourceCache, u.Cfg.OSM.URL, src.SaveStore)
+		if err == nil {
+			u.mu.Lock()
+			u.srcPath, u.srcBlob = path, nil
+			u.mu.Unlock()
+			return true, nil
+		}
+		if u.Log != nil {
+			u.Log.Warn("graph source cache write failed; retaining it in RAM", "err", err)
+		}
+	}
+	blob, err := src.EncodeStore()
+	if err != nil {
+		return false, err
+	}
+	u.mu.Lock()
+	u.srcPath, u.srcBlob = "", blob
+	u.mu.Unlock()
+	return false, nil
+}
+
+func (u *Updater) loadGraphSource() (*graph.SrcData, error) {
+	u.mu.Lock()
+	path, blob := u.srcPath, u.srcBlob
+	u.mu.Unlock()
+	if path != "" {
+		return graph.LoadStore(path)
+	}
+	if blob == nil {
+		return nil, fmt.Errorf("no graph source available")
+	}
+	return graph.DecodeStore(blob)
 }
 
 // InstallFeedZip records a remote feed's zip bytes and validators.
 func (u *Updater) InstallFeedZip(name string, res CondResult) {
 	u.mu.Lock()
 	fd := u.feeds[name]
-	fd.zip = res.Data
+	fd.zip, fd.path = res.Data, ""
+	fd.etag, fd.lastMod, fd.sha = res.ETag, res.LastMod, res.SHA256
+	u.mu.Unlock()
+}
+
+// InstallFeedFile records an already cached remote ZIP without retaining a
+// duplicate byte slice in the heap.
+func (u *Updater) InstallFeedFile(name, path string, res CondResult) {
+	u.mu.Lock()
+	fd := u.feeds[name]
+	fd.zip, fd.path = nil, path
 	fd.etag, fd.lastMod, fd.sha = res.ETag, res.LastMod, res.SHA256
 	u.mu.Unlock()
 }
@@ -91,7 +169,7 @@ func (u *Updater) MarkLocalFeed(name string, mtime time.Time) {
 	u.mu.Unlock()
 }
 
-// LoadFeeds parses every feed from RAM (remote) or from disk (local).
+// LoadFeeds parses every feed from its selected RAM or file backing.
 func (u *Updater) LoadFeeds() ([]*gtfs.Feed, error) {
 	var feeds []*gtfs.Feed
 	for _, f := range u.Cfg.Feeds {
@@ -101,12 +179,16 @@ func (u *Updater) LoadFeeds() ([]*gtfs.Feed, error) {
 			fd, err = gtfs.Load(config.LocalPath(f.URL), f.Name)
 		} else {
 			u.mu.Lock()
-			data := u.feeds[f.Name].zip
+			data, path := u.feeds[f.Name].zip, u.feeds[f.Name].path
 			u.mu.Unlock()
-			if data == nil {
-				return nil, fmt.Errorf("feed %s: no data in memory", f.Name)
+			switch {
+			case path != "":
+				fd, err = gtfs.Load(path, f.Name)
+			case data != nil:
+				fd, err = gtfs.LoadBytes(data, f.Name)
+			default:
+				return nil, fmt.Errorf("feed %s: no source data", f.Name)
 			}
-			fd, err = gtfs.LoadBytes(data, f.Name)
 		}
 		if err != nil {
 			return nil, fmt.Errorf("feed %s: %w", f.Name, err)
@@ -128,7 +210,12 @@ func (u *Updater) Start() {
 		replURL = gb.G.ReplicationURL
 	}
 	if strings.Contains(replURL, "download.geofabrik.de") {
-		go u.osmLoop(replURL)
+		go func() {
+			if err := u.syncOSM(replURL); err != nil {
+				u.Log.Error("initial osm sync failed", "err", err)
+			}
+			u.osmLoop(replURL)
+		}()
 	} else {
 		u.Log.Warn("OSM source has no Geofabrik replication stream: .osc live updates UNSUPPORTED, the street graph will age",
 			"replication_url", replURL,
@@ -180,9 +267,14 @@ func (u *Updater) syncRemoteFeed(f config.Feed) error {
 	}
 	u.Log.Info("gtfs changed, rebuilding timetable in background", "feed", f.Name,
 		"bytes", len(res.Data), "download", res.Duration.Round(time.Millisecond))
-	u.InstallFeedZip(f.Name, res)
-	if err := u.cache.StoreBytes("gtfs-"+f.Name+".zip", f.URL, res.Data, res.ETag, res.LastMod, res.SHA256); err != nil {
+	cacheName := "gtfs-" + f.Name + ".zip"
+	if err := u.cache.StoreBytes(cacheName, f.URL, res.Data, res.ETag, res.LastMod, res.SHA256); err != nil {
 		u.Log.Warn("gtfs cache write failed", "feed", f.Name, "err", err)
+		u.InstallFeedZip(f.Name, res)
+	} else if path, ok := u.cache.FilePath(cacheName); ok {
+		u.InstallFeedFile(f.Name, path, res)
+	} else {
+		u.InstallFeedZip(f.Name, res)
 	}
 	if err := u.RebuildTimetable(); err != nil {
 		return err
@@ -217,6 +309,8 @@ func (u *Updater) syncLocalFeed(f config.Feed) error {
 func (u *Updater) RebuildTimetable() error {
 	u.rebuildMu <- struct{}{}
 	defer func() { <-u.rebuildMu }()
+	done := memrelease.Begin()
+	defer done()
 
 	gb := u.E.GraphBundle()
 	if gb == nil {
@@ -278,17 +372,13 @@ func (u *Updater) syncOSM(updatesURL string) error {
 	}
 	u.Log.Info("osm diffs available", "have", cur, "remote", remote.Sequence)
 
-	// decode the in-RAM source, fold every pending diff in, reassemble, swap
+	// Load the compact source, fold every pending diff in, reassemble and swap.
+	done := memrelease.Begin()
+	defer done()
 	t0 := time.Now()
-	u.mu.Lock()
-	blob := u.srcBlob
-	u.mu.Unlock()
-	if blob == nil {
-		return fmt.Errorf("no graph source in memory")
-	}
-	src, err := graph.DecodeStore(blob)
+	src, err := u.loadGraphSource()
 	if err != nil {
-		return fmt.Errorf("graph source blob: %w", err)
+		return fmt.Errorf("graph source: %w", err)
 	}
 	for seq := cur + 1; seq <= remote.Sequence; seq++ {
 		oscURL := fmt.Sprintf("%s/%s.osc.gz", updatesURL, osm.SeqPath(seq))
@@ -308,14 +398,12 @@ func (u *Updater) syncOSM(updatesURL string) error {
 
 	st := &graph.BuildStats{}
 	g := graph.Assemble(src, st)
-	newBlob, err := src.EncodeStore()
-	if err != nil {
+	if _, err := u.SetGraphSource(src); err != nil {
 		return err
 	}
-	u.SetGraphSource(newBlob)
 	u.E.SetGraph(g)
 	debug.FreeOSMemory()
-	u.Log.Info("street graph swapped (zero downtime, no PBF, no disk)",
+	u.Log.Info("street graph swapped (zero downtime, no PBF re-download)",
 		"seq", remote.Sequence, "total", time.Since(t0).Round(time.Millisecond), "stats", st.String())
 	u.E.LastOSMSync.Store(time.Now())
 

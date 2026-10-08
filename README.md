@@ -5,7 +5,7 @@
 <p align="center">
   <img alt="Go 1.26+" src="https://img.shields.io/badge/go-1.26+-00ADD8?logo=go&logoColor=white">
   <img alt="dependencies: zero" src="https://img.shields.io/badge/dependencies-zero-38c172">
-  <img alt="disk footprint: zero" src="https://img.shields.io/badge/disk_footprint-0_bytes-38c172">
+  <img alt="disk footprint: adaptive" src="https://img.shields.io/badge/disk_footprint-adaptive-38c172">
   <img alt="binary" src="https://img.shields.io/badge/binary-~10_MB-4da3ff">
   <img alt="license MIT" src="https://img.shields.io/badge/license-MIT-8b95a5">
 </p>
@@ -30,8 +30,8 @@ files. GoTransit is the opposite bet, taken seriously:
 
 | | OTP-style | GoTransit *(centro Italia + Roma + COTRAL + Trenitalia, measured)* |
 |---|---|---|
-| 🧠 RAM | 4–8 GB | **~450 MB** (engine data + in-RAM sources) |
-| 💾 Disk | GBs | **zero bytes** — download → parse → destroy → poll |
+| 🧠 RAM | 4–8 GB | **scales from live flat data**, with automatic GC/cache budgets |
+| 💾 Disk | GBs | **zero by default**; optional compact source cache replaces the larger PBF |
 | ⚡ Boot | minutes | **~25 s** after download |
 | 🔁 Data updates | rebuild + restart | **live, atomic, zero downtime** |
 | ⚙️ Config | ~50 knobs, 3 files | **1 TOML**, two required lines |
@@ -63,8 +63,8 @@ files. GoTransit is the opposite bet, taken seriously:
   network vs a centro-Italia extract: 18 800 trips on 2 601 routes cut, all
   accounted for at startup and in `/v1/status`).
 - **🔄 Zero-downtime everything** — GTFS re-polled every minute via ETag; OSM
-  updated through Geofabrik osmChange diffs applied to an in-RAM compressed
-  source (no PBF re-download, no disk); every refresh builds an immutable
+  updated through Geofabrik osmChange diffs applied to a compact source image
+  (file-backed when `[cache]` exists, in RAM otherwise); every refresh builds an immutable
   snapshot and swaps a pointer. In-flight queries never notice.
 
 ## 📡 Live: the engine that never leaves you alone
@@ -125,7 +125,7 @@ wins merely because the original itinerary contained a bike.
 | Walk, turn-by-turn | 5 ms |
 | Car Roma → Firenze, 275 km | ~60 ms |
 | GTFS change → new timetable live | ~4 s background |
-| OSM daily diff → new street graph live | ~5 s background, no PBF, no disk |
+| OSM daily diff → new street graph live | ~5 s background, no PBF re-download |
 
 Live matching observed on production feeds: ATAC **1055/1055** trips,
 COTRAL 485/521, Trenitalia 260 in-extract (+7 CANCELED caught at test time),
@@ -157,6 +157,10 @@ Every leg carries encoded polylines, per-stop times with codes, distances,
 
 ```toml
 listen = ":8080"
+
+# Optional: keeps remote GTFS ZIPs and the compact OSM update image off-heap.
+# [cache]
+# dir = "/var/cache/gotransit"
 
 [osm]
 url  = "https://download.geofabrik.de/europe/italy/centro-latest.osm.pbf"
@@ -211,8 +215,8 @@ every PR.
 ## 🏗️ How it works
 
 One page: [ARCHITECTURE.md](ARCHITECTURE.md). Spoiler: flat arrays, atomic
-pointer swaps, immutable snapshots, and a stubborn refusal to keep anything
-on disk or import anything at all.
+pointer swaps, immutable snapshots, adaptive memory control, and zero runtime
+dependencies.
 
 ## 🤝 Contributing
 

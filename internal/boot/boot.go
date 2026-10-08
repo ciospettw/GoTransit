@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime/debug"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -19,6 +20,7 @@ import (
 	"gotransit/internal/engine"
 	"gotransit/internal/gbfs"
 	"gotransit/internal/graph"
+	"gotransit/internal/memrelease"
 	"gotransit/internal/rt"
 	"gotransit/internal/stats"
 	"gotransit/internal/track"
@@ -93,74 +95,97 @@ func (r *Runtime) Run() {
 	cache := updater.Cache{Dir: cfg.Cache.Dir}
 
 	// ---- street graph ----
-	pbfPath := ""
-	ephemeralPBF := false
-	switch {
-	case cfg.OSMLocal():
-		pbfPath = config.LocalPath(cfg.OSM.URL)
-		log.Info("using local OSM extract (kept in place)", "path", pbfPath)
-	case cache.Enabled():
-		// warm restart: revalidate with conditional GET, reuse on 304 —
-		// a 380 MB extract that didn't change is not downloaded again
-		meta, _ := cache.Meta("osm.pbf", cfg.OSM.URL)
-		cached, hasFile := cache.FilePath("osm.pbf")
-		etag, lastMod := "", ""
-		if hasFile {
-			etag, lastMod = meta.ETag, meta.LastMod
+	var g *graph.Graph
+	if !cfg.OSMLocal() {
+		if src, ok := up.LoadCachedGraphSource(); ok {
+			st := &graph.BuildStats{}
+			candidate := graph.Assemble(src, st)
+			if supportsLiveOSM(candidate) {
+				g = candidate
+				log.Info("street graph restored from compact source cache", "stats", st.String(), "osm_seq", g.ReplicationSeq)
+			} else {
+				up.DiscardCachedGraphSource()
+			}
 		}
-		retryForever(log, "osm download", func() error {
-			tmp, n, changed, etagOut, lastModOut, err := updater.FetchToTempCond(cfg.OSM.URL, cfg.OSM.AllowInsecure, etag, lastMod)
-			switch {
-			case err != nil && hasFile:
-				log.Warn("OSM revalidation failed: using the cached extract", "err", err)
-				pbfPath = cached
-			case err != nil:
-				return err
-			case !changed:
-				log.Info("OSM unchanged upstream (304): using the cached extract", "path", cached)
-				pbfPath = cached
-			default:
-				p, aerr := cache.AdoptFile("osm.pbf", cfg.OSM.URL, tmp, etagOut, lastModOut)
-				if aerr != nil {
-					os.Remove(tmp)
-					return aerr
+	}
+	if g == nil {
+		pbfPath := ""
+		ephemeralPBF := false
+		switch {
+		case cfg.OSMLocal():
+			pbfPath = config.LocalPath(cfg.OSM.URL)
+			log.Info("using local OSM extract (kept in place)", "path", pbfPath)
+		case cache.Enabled():
+			meta, _ := cache.Meta("osm.pbf", cfg.OSM.URL)
+			cached, hasFile := cache.FilePath("osm.pbf")
+			etag, lastMod := "", ""
+			if hasFile {
+				etag, lastMod = meta.ETag, meta.LastMod
+			}
+			retryForever(log, "osm download", func() error {
+				tmp, n, changed, etagOut, lastModOut, err := updater.FetchToTempCond(cfg.OSM.URL, cfg.OSM.AllowInsecure, etag, lastMod)
+				switch {
+				case err != nil && hasFile:
+					log.Warn("OSM revalidation failed: using the cached extract", "err", err)
+					pbfPath = cached
+				case err != nil:
+					return err
+				case !changed && hasFile:
+					log.Info("OSM unchanged upstream (304): using the cached extract", "path", cached)
+					pbfPath = cached
+				default:
+					p, aerr := cache.AdoptFile("osm.pbf", cfg.OSM.URL, tmp, etagOut, lastModOut)
+					if aerr != nil {
+						os.Remove(tmp)
+						return aerr
+					}
+					pbfPath = p
+					log.Info("OSM extract downloaded into cache", "MB", n/1e6, "path", p)
 				}
-				pbfPath = p
-				log.Info("OSM extract downloaded into cache", "MB", n/1e6, "path", p)
-			}
-			return nil
-		})
-	default:
-		log.Info("downloading OSM extract to a temp file", "url", cfg.OSM.URL)
-		retryForever(log, "osm download", func() error {
-			p, n, err := updater.FetchToTemp(cfg.OSM.URL, cfg.OSM.AllowInsecure)
+				return nil
+			})
+		default:
+			log.Info("downloading OSM extract to a temp file", "url", cfg.OSM.URL)
+			retryForever(log, "osm download", func() error {
+				p, n, err := updater.FetchToTemp(cfg.OSM.URL, cfg.OSM.AllowInsecure)
+				if err != nil {
+					return err
+				}
+				pbfPath, ephemeralPBF = p, true
+				log.Info("OSM extract downloaded", "MB", n/1e6)
+				return nil
+			})
+		}
+		var src *graph.SrcData
+		var st *graph.BuildStats
+		var err error
+		g, src, st, err = graph.BuildFromPBF(pbfPath, 0)
+		if ephemeralPBF {
+			_ = os.Remove(pbfPath)
+		}
+		if err != nil {
+			log.Error("graph build failed", "err", err)
+			os.Exit(1)
+		}
+		log.Info("street graph built", "stats", st.String(), "osm_seq", g.ReplicationSeq)
+		if supportsLiveOSM(g) {
+			fileBacked, err := up.SetGraphSource(src)
 			if err != nil {
-				return err
+				log.Error("graph source encode failed", "err", err)
+				os.Exit(1)
 			}
-			pbfPath, ephemeralPBF = p, true
-			log.Info("OSM extract downloaded", "MB", n/1e6)
-			return nil
-		})
+			if fileBacked && !cfg.OSMLocal() {
+				cache.Remove("osm.pbf")
+				log.Info("compact graph source cached; larger PBF removed")
+			} else if fileBacked {
+				log.Info("compact graph source cached; local PBF kept in place")
+			} else {
+				log.Info("graph source retained in RAM (cache disabled)")
+			}
+		} else {
+			log.Info("OSM source has no supported live updates; retaining the revalidatable PBF instead of a graph source copy")
+		}
 	}
-	g, src, st, err := graph.BuildFromPBF(pbfPath, 0)
-	if ephemeralPBF {
-		os.Remove(pbfPath) // parse done: destroy — nothing stays on disk
-	}
-	if err != nil {
-		log.Error("graph build failed", "err", err)
-		os.Exit(1)
-	}
-	log.Info("street graph built", "stats", st.String(), "osm_seq", g.ReplicationSeq)
-	if ephemeralPBF {
-		log.Info("temp PBF deleted — the graph source now lives compressed in RAM")
-	}
-	blob, err := src.EncodeStore()
-	if err != nil {
-		log.Error("graph source encode failed", "err", err)
-		os.Exit(1)
-	}
-	up.SetGraphSource(blob)
-	log.Info("graph source held in RAM for live osc updates", "MB", len(blob)/1e6)
 	e.SetGraph(g)
 
 	// ---- GTFS feeds ----
@@ -179,34 +204,36 @@ func (r *Runtime) Run() {
 		// on 304 (or sha match) the cached zip is reused, nothing re-downloads
 		cacheName := "gtfs-" + f.Name + ".zip"
 		meta, _ := cache.Meta(cacheName, f.URL)
-		cachedZip, _ := cache.LoadBytes(cacheName)
+		cachedPath, hasCached := cache.FilePath(cacheName)
 		etag, lastMod, sha := "", "", ""
-		if cachedZip != nil {
+		if hasCached {
 			etag, lastMod, sha = meta.ETag, meta.LastMod, meta.SHA256
 		}
 		installCached := func(why string) {
-			up.InstallFeedZip(f.Name, updater.CondResult{
-				Data: cachedZip, Changed: true, ETag: meta.ETag, LastMod: meta.LastMod, SHA256: meta.SHA256,
-			})
-			log.Info("GTFS from cache ("+why+")", "feed", f.Name, "MB", len(cachedZip)/1e6)
+			up.InstallFeedFile(f.Name, cachedPath, updater.CondResult{Changed: true, ETag: meta.ETag, LastMod: meta.LastMod, SHA256: meta.SHA256})
+			log.Info("GTFS from file cache ("+why+")", "feed", f.Name)
 		}
-		log.Info("downloading GTFS into memory", "feed", f.Name, "url", f.URL)
+		log.Info("revalidating GTFS", "feed", f.Name, "url", f.URL)
 		retryForever(log, "gtfs download "+f.Name, func() error {
 			res, err := updater.FetchBytesCond(f.URL, f.AllowInsecure, etag, lastMod, sha, f.Headers)
 			switch {
-			case err != nil && cachedZip != nil:
+			case err != nil && hasCached:
 				log.Warn("GTFS revalidation failed: using the cached zip", "feed", f.Name, "err", err)
 				installCached("fetch failed")
 			case err != nil:
 				return err
-			case !res.Changed && cachedZip != nil:
+			case !res.Changed && hasCached:
 				installCached("unchanged upstream")
 			default:
-				up.InstallFeedZip(f.Name, res)
 				if serr := cache.StoreBytes(cacheName, f.URL, res.Data, res.ETag, res.LastMod, res.SHA256); serr != nil {
 					log.Warn("GTFS cache write failed", "feed", f.Name, "err", serr)
+					up.InstallFeedZip(f.Name, res)
+				} else if path, ok := cache.FilePath(cacheName); ok {
+					up.InstallFeedFile(f.Name, path, res)
+				} else {
+					up.InstallFeedZip(f.Name, res)
 				}
-				log.Info("GTFS in memory", "feed", f.Name, "MB", len(res.Data)/1e6, "etag", res.ETag != "")
+				log.Info("GTFS refreshed", "feed", f.Name, "MB", len(res.Data)/1e6, "etag", res.ETag != "")
 			}
 			return nil
 		})
@@ -327,11 +354,16 @@ func (r *Runtime) Run() {
 		log.Info("no gtfs-rt sources configured: tracking runs in schedule-only monitor mode")
 	}
 
-	up.Start()
 	debug.FreeOSMemory() // build transients go back to the OS immediately
-	log.Info("engine ready — fully in RAM, zero files, updates run themselves",
+	memrelease.Start(context.Background(), e.TrimScratch)
+	up.Start()
+	log.Info("engine ready — query data resident, source storage automatic, updates run themselves",
 		"boot", time.Since(t0).Round(time.Millisecond))
 	if r.OnReady != nil {
 		r.OnReady()
 	}
+}
+
+func supportsLiveOSM(g *graph.Graph) bool {
+	return g != nil && strings.Contains(g.ReplicationURL, "download.geofabrik.de")
 }

@@ -1,8 +1,6 @@
 // Package updater keeps a running engine in sync with its remote sources:
 // GTFS zips via ETag conditional GET, OSM via Geofabrik osmChange replication.
-// Ephemeral by design: remote data lives in RAM, nothing is written to disk
-// (the OSM extract only touches a temp file during the initial parse).
-// Local file sources are the exception — used in place, never deleted.
+// Sources are ephemeral when cache.dir is empty and file-backed otherwise.
 package updater
 
 import (

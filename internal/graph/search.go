@@ -35,6 +35,13 @@ func NewNearSearch(numNodes int) *NearSearch {
 	}
 }
 
+// MemoryBytes reports retained backing arrays, so the engine can budget idle
+// search states independently of the network size.
+func (s *NearSearch) MemoryBytes() uint64 {
+	return uint64(cap(s.dist))*2 + uint64(cap(s.stamp))*2 +
+		uint64(cap(s.parent))*4 + uint64(cap(s.heap))*8 + uint64(cap(s.touched))*4
+}
+
 const maxNearDs = 65000
 
 // Run explores from seeds until maxDs (deciseconds), in mode m.
@@ -147,6 +154,12 @@ func NewRoadSearch(numNodes int) *RoadSearch {
 		stamp:  make([]uint32, numNodes),
 		parent: make([]int32, numNodes),
 	}
+}
+
+// MemoryBytes reports retained backing arrays.
+func (s *RoadSearch) MemoryBytes() uint64 {
+	return uint64(cap(s.dist))*4 + uint64(cap(s.stamp))*4 +
+		uint64(cap(s.parent))*4 + uint64(cap(s.heap))*8
 }
 
 // RoadResult is a point-to-point route as directed edges.

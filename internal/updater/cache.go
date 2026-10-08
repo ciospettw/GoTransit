@@ -9,10 +9,10 @@ import (
 	"path/filepath"
 )
 
-// Cache is the optional on-disk copy of remote sources ([cache] dir in the
-// config). It exists for one reason: a warm restart should revalidate with a
-// conditional GET and reuse what it already has, not re-download a 380 MB
-// extract that didn't change. Empty Dir = disabled, fully ephemeral.
+// Cache is optional persistent source storage ([cache] dir in the config).
+// Remote GTFS files are revalidated in place; the initial OSM PBF is replaced
+// by the smaller derived graph-source image used for warm boots and live diffs.
+// Empty Dir = disabled, fully ephemeral.
 //
 // Layout: <dir>/<name> holds the payload, <dir>/<name>.meta.json the source
 // URL and validators (ETag / Last-Modified / SHA-256). A meta whose URL no
@@ -26,6 +26,35 @@ type Cache struct {
 func (c Cache) Enabled() bool { return c.Dir != "" }
 
 func (c Cache) path(name string) string { return filepath.Join(c.Dir, name) }
+
+// StoreGenerated atomically installs a derived resource through write. The
+// callback must write path atomically (graph.SaveStore does); metadata binds
+// the result to the configured source URL.
+func (c Cache) StoreGenerated(name, url string, write func(path string) error) (string, error) {
+	if !c.Enabled() {
+		return "", fmt.Errorf("cache disabled")
+	}
+	if err := os.MkdirAll(c.Dir, 0o755); err != nil {
+		return "", err
+	}
+	path := c.path(name)
+	if err := write(path); err != nil {
+		return "", err
+	}
+	if err := c.writeMeta(name, CacheMeta{URL: url}); err != nil {
+		return "", err
+	}
+	return path, nil
+}
+
+// Remove deletes one cached payload and its metadata.
+func (c Cache) Remove(name string) {
+	if !c.Enabled() {
+		return
+	}
+	_ = os.Remove(c.path(name))
+	_ = os.Remove(c.path(name) + ".meta.json")
+}
 
 // CacheMeta are the stored validators for one cached resource.
 type CacheMeta struct {

@@ -10,10 +10,9 @@ import (
 	"os"
 )
 
-// SrcData persistence: the compact graph source survives as one compressed
-// blob (in RAM by default — the engine keeps no files) so live osmChange
-// updates never re-read the PBF. Flate(1), varint and delta encoded — a
-// fraction of the PBF's size, decodes in ~a second.
+// SrcData persistence is a compact restart/update image. Flate(1), varint and
+// delta encoding make it a fraction of the PBF size. Both streaming files and
+// in-memory blobs use exactly the same format.
 
 const storeMagic = "GTSS0002"
 
@@ -22,43 +21,82 @@ const storeMagic = "GTSS0002"
 // RAM (a fraction of the PBF's size) and feeds osmChange diff application.
 func (src *SrcData) EncodeStore() ([]byte, error) {
 	var buf bytes.Buffer
-	buf.Grow(64 << 20)
-	buf.WriteString(storeMagic)
-	fw, _ := flate.NewWriter(&buf, flate.BestSpeed)
-	w := &countWriter{w: fw}
-	src.encode(w)
-	if w.err != nil {
-		return nil, w.err
-	}
-	if err := fw.Close(); err != nil {
+	buf.Grow(src.storeSizeHint())
+	if err := src.WriteStore(&buf); err != nil {
 		return nil, err
 	}
 	return buf.Bytes(), nil
 }
 
-// DecodeStore parses a blob produced by EncodeStore.
-func DecodeStore(data []byte) (*SrcData, error) {
-	if len(data) < len(storeMagic) || string(data[:len(storeMagic)]) != storeMagic {
-		return nil, fmt.Errorf("store: bad magic (old or foreign blob)")
+// storeSizeHint avoids both a fixed country-sized allocation for small feeds
+// and repeated tiny buffer growth for larger ephemeral sources. It is only a
+// capacity hint; the writer grows normally for unusual data distributions.
+func (src *SrcData) storeSizeHint() int {
+	const maxHint = 64 << 20
+	size := uint64(1024 + len(src.ways)*12 + len(src.refs)*3 + len(src.ids)*8)
+	for _, name := range src.names {
+		size += uint64(len(name) + 2)
 	}
-	r := &countReader{r: bufio.NewReaderSize(flate.NewReader(bytes.NewReader(data[len(storeMagic):])), 1<<20)}
-	src := &SrcData{}
-	src.decode(r)
-	if r.err != nil {
-		return nil, fmt.Errorf("store: %w", r.err)
+	if size > maxHint {
+		return maxHint
 	}
-	return src, nil
+	return int(size)
 }
 
-// SaveStore writes the blob to a file (tests and tooling; the server itself
-// keeps no files).
-func (src *SrcData) SaveStore(path string) error {
-	data, err := src.EncodeStore()
+// WriteStore streams the encoded source without materializing a second copy.
+func (src *SrcData) WriteStore(dst io.Writer) error {
+	if _, err := io.WriteString(dst, storeMagic); err != nil {
+		return err
+	}
+	fw, err := flate.NewWriter(dst, flate.BestSpeed)
 	if err != nil {
 		return err
 	}
+	w := &countWriter{w: fw}
+	src.encode(w)
+	if w.err != nil {
+		_ = fw.Close()
+		return w.err
+	}
+	return fw.Close()
+}
+
+// DecodeStore parses a blob produced by EncodeStore.
+func DecodeStore(data []byte) (*SrcData, error) {
+	return ReadStore(bytes.NewReader(data))
+}
+
+// ReadStore streams and decodes one source image.
+func ReadStore(src io.Reader) (*SrcData, error) {
+	magic := make([]byte, len(storeMagic))
+	if _, err := io.ReadFull(src, magic); err != nil || string(magic) != storeMagic {
+		return nil, fmt.Errorf("store: bad magic (old or foreign blob)")
+	}
+	fr := flate.NewReader(src)
+	defer fr.Close()
+	r := &countReader{r: bufio.NewReaderSize(fr, 1<<20)}
+	data := &SrcData{}
+	data.decode(r)
+	if r.err != nil {
+		return nil, fmt.Errorf("store: %w", r.err)
+	}
+	return data, nil
+}
+
+// SaveStore atomically streams the compact image to a file.
+func (src *SrcData) SaveStore(path string) error {
 	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+	f, err := os.Create(tmp)
+	if err != nil {
+		return err
+	}
+	if err = src.WriteStore(f); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err = f.Close(); err != nil {
+		os.Remove(tmp)
 		return err
 	}
 	return os.Rename(tmp, path)
@@ -66,11 +104,12 @@ func (src *SrcData) SaveStore(path string) error {
 
 // LoadStore reads a file written by SaveStore.
 func LoadStore(path string) (*SrcData, error) {
-	data, err := os.ReadFile(path)
+	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
-	return DecodeStore(data)
+	defer f.Close()
+	return ReadStore(f)
 }
 
 func (src *SrcData) encode(w *countWriter) {

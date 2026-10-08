@@ -11,9 +11,8 @@ import (
 	"gotransit/internal/toml"
 )
 
-// Feed is one GTFS static source: a remote URL (polled with ETag, downloaded
-// into memory, never written to disk) or a local file path (kept, reloaded
-// when its mtime changes).
+// Feed is one GTFS static source: a remote URL (polled with ETag and optionally
+// file-backed by [cache]) or a local file path (kept and reloaded on change).
 type Feed struct {
 	Name          string // short identifier, used in stop ids ("roma:70431")
 	URL           string
@@ -67,9 +66,8 @@ type Config struct {
 		AllowInsecure bool
 	}
 
-	// Cache: optional on-disk copy of remote sources. When set, warm
-	// restarts revalidate with conditional GET (ETag / Last-Modified) and
-	// reuse the cached OSM extract / GTFS zips instead of re-downloading.
+	// Cache: optional persistent source tier. Remote GTFS ZIPs stay file-backed;
+	// the initial OSM PBF becomes a smaller graph-source restart/update image.
 	// Empty = fully ephemeral (the default, nothing ever touches disk).
 	Cache struct {
 		Dir string

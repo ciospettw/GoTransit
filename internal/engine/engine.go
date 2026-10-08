@@ -12,6 +12,7 @@ import (
 	"gotransit/internal/config"
 	"gotransit/internal/gbfs"
 	"gotransit/internal/graph"
+	"gotransit/internal/memrelease"
 	"gotransit/internal/stats"
 	"gotransit/internal/transit"
 )
@@ -19,36 +20,97 @@ import (
 // GraphBundle pairs a graph with search-state pools sized for it.
 type GraphBundle struct {
 	G    *graph.Graph
-	near sync.Pool
-	road sync.Pool
+	near scratchPool[*graph.NearSearch]
+	road scratchPool[*graph.RoadSearch]
 }
 
 func NewGraphBundle(g *graph.Graph) *GraphBundle {
 	b := &GraphBundle{G: g}
-	b.near.New = func() any { return graph.NewNearSearch(g.NumNodes()) }
-	b.road.New = func() any { return graph.NewRoadSearch(g.NumNodes()) }
+	b.near.new = func() *graph.NearSearch { return graph.NewNearSearch(g.NumNodes()) }
+	b.near.size = func(s *graph.NearSearch) uint64 { return s.MemoryBytes() }
+	b.road.new = func() *graph.RoadSearch { return graph.NewRoadSearch(g.NumNodes()) }
+	b.road.size = func(s *graph.RoadSearch) uint64 { return s.MemoryBytes() }
 	return b
 }
 
-func (b *GraphBundle) Near() *graph.NearSearch     { return b.near.Get().(*graph.NearSearch) }
-func (b *GraphBundle) PutNear(s *graph.NearSearch) { b.near.Put(s) }
-func (b *GraphBundle) Road() *graph.RoadSearch     { return b.road.Get().(*graph.RoadSearch) }
-func (b *GraphBundle) PutRoad(s *graph.RoadSearch) { b.road.Put(s) }
+func (b *GraphBundle) Near() *graph.NearSearch     { return b.near.get() }
+func (b *GraphBundle) PutNear(s *graph.NearSearch) { b.near.put(s) }
+func (b *GraphBundle) Road() *graph.RoadSearch     { return b.road.get() }
+func (b *GraphBundle) PutRoad(s *graph.RoadSearch) { b.road.put(s) }
 
 // TTBundle pairs a timetable with RAPTOR state pools sized for it.
 type TTBundle struct {
 	TT  *transit.Timetable
-	rap sync.Pool
+	rap scratchPool[*transit.Raptor]
 }
 
 func NewTTBundle(tt *transit.Timetable) *TTBundle {
 	b := &TTBundle{TT: tt}
-	b.rap.New = func() any { return transit.NewRaptor(tt) }
+	b.rap.new = func() *transit.Raptor { return transit.NewRaptor(tt) }
+	b.rap.size = func(r *transit.Raptor) uint64 { return r.MemoryBytes() }
 	return b
 }
 
-func (b *TTBundle) Raptor() *transit.Raptor     { return b.rap.Get().(*transit.Raptor) }
-func (b *TTBundle) PutRaptor(r *transit.Raptor) { b.rap.Put(r) }
+func (b *TTBundle) Raptor() *transit.Raptor     { return b.rap.get() }
+func (b *TTBundle) PutRaptor(r *transit.Raptor) { b.rap.put(r) }
+
+// Unlike sync.Pool, hot states survive idle-memory collection. Their count is
+// derived from their real byte size and the controller's live memory budget.
+type scratchPool[T any] struct {
+	mu   sync.Mutex
+	new  func() T
+	size func(T) uint64
+	max  func(uint64) int // test seam; nil uses the process memory controller
+	idle []T
+}
+
+func (p *scratchPool[T]) get() T {
+	p.mu.Lock()
+	n := len(p.idle)
+	if n > 0 {
+		value := p.idle[n-1]
+		var zero T
+		p.idle[n-1] = zero
+		p.idle = p.idle[:n-1]
+		p.mu.Unlock()
+		return value
+	}
+	p.mu.Unlock()
+	return p.new()
+}
+
+func (p *scratchPool[T]) put(value T) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(p.idle) < p.limit(p.size(value)) {
+		p.idle = append(p.idle, value)
+	}
+}
+
+func (p *scratchPool[T]) limit(bytes uint64) int {
+	if p.max != nil {
+		return p.max(bytes)
+	}
+	return memrelease.IdleCacheEntries(bytes)
+}
+
+func (p *scratchPool[T]) trim(pressure bool) uint64 {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	limit := 0
+	if !pressure && len(p.idle) > 0 {
+		limit = p.limit(p.size(p.idle[0]))
+	}
+	var dropped uint64
+	for len(p.idle) > limit {
+		i := len(p.idle) - 1
+		dropped += p.size(p.idle[i])
+		var zero T
+		p.idle[i] = zero
+		p.idle = p.idle[:i]
+	}
+	return dropped
+}
 
 // Engine is the live routing engine.
 type Engine struct {
@@ -116,6 +178,20 @@ func (e *Engine) GraphBundle() *GraphBundle { return e.gb.Load() }
 // TTBundle returns the current timetable snapshot (nil before boot).
 func (e *Engine) TTBundle() *TTBundle { return e.tb.Load() }
 
+// TrimScratch applies the current byte budget to the active immutable bundles.
+// It is called immediately before the runtime scavenges idle pages.
+func (e *Engine) TrimScratch(pressure bool) uint64 {
+	var dropped uint64
+	if b := e.gb.Load(); b != nil {
+		dropped += b.near.trim(pressure)
+		dropped += b.road.trim(pressure)
+	}
+	if b := e.tb.Load(); b != nil {
+		dropped += b.rap.trim(pressure)
+	}
+	return dropped
+}
+
 // Ready reports whether both graph and timetable are installed.
 func (e *Engine) Ready() bool { return e.gb.Load() != nil && e.tb.Load() != nil }
 
@@ -131,15 +207,16 @@ func (e *Engine) Timezone() *time.Location {
 
 // Status is the /v1/status payload.
 type Status struct {
-	Uptime         string        `json:"uptime"`
-	HeapMB         float64       `json:"heap_mb"`
-	Queries        int64         `json:"queries"`
-	Graph          GraphStatus   `json:"graph"`
-	Transit        TransitStatus `json:"transit"`
-	Realtime       any           `json:"realtime,omitempty"`
-	SharedMobility any           `json:"shared_mobility,omitempty"`
-	Excluded       any           `json:"excluded_routes,omitempty"`
-	UnsnappedStop  int           `json:"stops_without_street_access"`
+	Uptime         string            `json:"uptime"`
+	HeapMB         float64           `json:"heap_mb"`
+	MemoryControl  memrelease.Status `json:"memory_control"`
+	Queries        int64             `json:"queries"`
+	Graph          GraphStatus       `json:"graph"`
+	Transit        TransitStatus     `json:"transit"`
+	Realtime       any               `json:"realtime,omitempty"`
+	SharedMobility any               `json:"shared_mobility,omitempty"`
+	Excluded       any               `json:"excluded_routes,omitempty"`
+	UnsnappedStop  int               `json:"stops_without_street_access"`
 }
 
 type GraphStatus struct {
@@ -167,9 +244,10 @@ func (e *Engine) Status() Status {
 	var ms runtime.MemStats
 	runtime.ReadMemStats(&ms)
 	st := Status{
-		Uptime:  time.Since(e.Started).Round(time.Second).String(),
-		HeapMB:  float64(ms.HeapAlloc) / 1e6,
-		Queries: e.Queries.Load(),
+		Uptime:        time.Since(e.Started).Round(time.Second).String(),
+		HeapMB:        float64(ms.HeapAlloc) / 1e6,
+		MemoryControl: memrelease.Snapshot(),
+		Queries:       e.Queries.Load(),
 	}
 	if gb := e.gb.Load(); gb != nil {
 		st.Graph = GraphStatus{
